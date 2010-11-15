@@ -570,7 +570,7 @@ AC_SUBST(enable_thread_safety)
 # Settings for replication
 #
 AC_MSG_CHECKING([whether to build in replication support])
-PGAC_ARG_BOOL(enable, replication, no, [  --enable-replication    build in replication support],
+PGAC_ARG_BOOL(enable, replication, yes, [  --enable-replication    build in replication support],
               [AC_DEFINE([REPLICATION], 1, [Define to 1 to build with replication support. (--enable-replication)])])
 AC_MSG_RESULT([$enable_replication])
 AC_SUBST(enable_replication)
