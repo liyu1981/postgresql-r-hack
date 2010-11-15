@@ -724,6 +724,7 @@ with_gssapi
 with_python
 with_perl
 with_tcl
+enable_replication
 enable_thread_safety
 INCLUDES
 autodepend
@@ -825,6 +826,7 @@ with_CC
 enable_depend
 enable_cassert
 enable_thread_safety
+enable_replication
 with_tcl
 with_tclconfig
 with_perl
@@ -1500,6 +1502,7 @@ Optional Features:
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-thread-safety disable thread-safety in client libraries
+  --disable-replication   --enable-replication build in replication support
   --disable-largefile     omit support for large files
   --disable-float4-byval  disable float4 passed by value
   --disable-float8-byval  disable float8 passed by value
@@ -4894,6 +4897,48 @@ _ACEOF
 fi
 { $as_echo "$as_me:$LINENO: result: $enable_thread_safety" >&5
 $as_echo "$enable_thread_safety" >&6; }
+
+
+#
+# Settings for replication
+#
+{ $as_echo "$as_me:$LINENO: checking whether to build in replication support" >&5
+$as_echo_n "checking whether to build in replication support... " >&6; }
+
+
+# Check whether --enable-replication was given.
+if test "${enable_replication+set}" = set; then
+  enableval=$enable_replication;
+  case $enableval in
+    yes)
+
+cat >>confdefs.h <<\_ACEOF
+#define REPLICATION 1
+_ACEOF
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      { { $as_echo "$as_me:$LINENO: error: no argument expected for --enable-replication option" >&5
+$as_echo "$as_me: error: no argument expected for --enable-replication option" >&2;}
+   { (exit 1); exit 1; }; }
+      ;;
+  esac
+
+else
+  enable_replication=yes
+
+cat >>confdefs.h <<\_ACEOF
+#define REPLICATION 1
+_ACEOF
+
+fi
+
+
+{ $as_echo "$as_me:$LINENO: result: $enable_replication" >&5
+$as_echo "$enable_replication" >&6; }
 
 
 #
