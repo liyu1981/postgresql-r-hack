@@ -1,0 +1,91 @@
+Postgres Replication
+====================
+
+This directory originates from the Postgres-R sub-project, which mainly
+implements an eager, update everywhere (AKA multi-master) replication
+solution. Work is underway to extend this module to also handle fully
+synchronous as well as asynchronous replication.
+
+Postgres-R is disabled by default and should have no impact on PostgreSQL.
+To enable replication, you need to pass the '--enable-replication' option
+to the configure script. As Postgres-R comes with it's own interfaces to
+the different group communication systems used, no additional libraries
+are needed, compared to standard Postgres. However, at the moment, neither
+the ensemble nor the spread interface are functional.
+
+
+Architectural Overview
+----------------------
+
+Postgres-R is designed to run on shared-nothing clusters with a low latency
+interconnect. It provides multi-master replication on the basis of binary
+changeset replication. It features a modular design and interfaces for
+multiple group communication systems.
+
+In addition to standard Postgres, it forks an additional helper process
+called the coordinator. That process keeps track of the state of changeset
+application and forwards messages between backends and the group
+communication system.
+
+
+The Group Communication System
+------------------------------
+
+All of the communication, liveness checking and group membership management
+is delegated to the GCS. It provides abstract and efficient building
+blocks for totally ordered delivery of messages, group consensus and
+failure detection.
+
+To prevent the infamous split brain situation, the underlying GCS for
+Postgres-R should only allow the majority of nodes to continue processing
+transactions.
+
+
+The Coordinator
+---------------
+
+As a coordinator between all the backends and the group communication
+system, it needs to react promptly and pass on messages as appropriate, or
+cache messages which cannot currently be delivered. It keeps track of the
+state of the background workers and communicates with the GCS.
+
+The coordinator communicates with the background workers via message passing
+in shared memory, so called imessages.
+
+
+Background Workers
+------------------
+
+The coordinator itself does not interfere much with the database and its
+internal state in shared memory. It delegates real work to special backends,
+which do not have a connection to a client, but do their work in the
+background. Otherwise these backensd are very similar to a normal
+transaction's backend: they can process exactly one transaction at a time
+and are connected to a single database.
+
+To be able to replicate multiple databases and transactions in parallel, the
+coordinator starts several of these background workers to apply change sets
+of remote transactions concurrently. Special care is taken with regard to
+locking and ordering of commits, making use of MVCC for conflict detection.
+
+Note that these background workers were formerly called "remote" or "helper"
+backends.
+
+
+Changes to Postgres
+-------------------
+
+The following is a list of changes to standard Postgres, which do not
+necessarily have to do with replication. But they made it easier for
+Postgres-R. However, with the Postgres-R patch, these changes are always
+enabled and independent of the REPLICATION setting.
+
+ * Added the system catalog replication_gcs plus some fields to pg_database
+   about the per database replication configuration.
+
+ * Sequences got an additional replication cache to sequences. Very
+   similar to the per-backend cache, this reserves a couple of suquence
+   numbers per node, so as to reduce communication overhead for sequences.
+
+ * Added an ii_Primary field to the IndexInfo struct.
+

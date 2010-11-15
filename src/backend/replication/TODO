@@ -1,0 +1,244 @@
+
+
+
+* Termination of idle workers still requires a PGPROC lookup just to send it
+  the SIGTERM signal. That might be simplified by the procsignal stuff.
+
+* Merge with postgres-dtester
+
+* Implement get_node_desc for ensemble (and maybe spread).
+* Differenciate gc_send_imsg() into a multicast and a consensus method.
+
+3.2.1 Internal Message Passing
+==============================
+
+* Make sure the coordinator copes with killed backends (local as
+  well as remote ones).
+
+* Check if we can use pselect to avoid race conditions with IMessage stuff
+  within the coordinator's main loop.
+
+  complaint about select() not interrupted by signals:
+  http://archives.postgresql.org/pgsql-hackers/2008-12/msg00448.php
+
+  restartable signals 'n all that
+  http://archives.postgresql.org/pgsql-hackers/2007-07/msg00003.php
+
+  Further research revealed that pselect() should be possible to implement
+  on Win32 (as we use a pipe and an event listener thread anyway) and is
+  available on Linux as of 2.6.16 (Released Mar 2006). Glibc 2.1 features
+  an emulation prone to the race condition, not sure how to circumvent that.
+
+  The self-pipe trick might be used to prevent that race condition, but
+  to prevent against restarting of the select(), pretty much *every* signal
+  would have to write to the pipe to really interrupt the select(). While
+  protecting against the race condition with IMessages, only SIGUSR1 for
+  IMessages needs to be caught.
+
+* Check error conditions such as out of memory and out of disk space. Those
+  could prevent a single node from applying a remote transaction. What to
+  do in such cases? A similar one is "limit of queued remote transactions
+  reached".
+
+
+3.2.2 Communication with the Postmaster
+=======================================
+
+* Handle restarts of the coordinator due to a crashed backend. The
+  postmaster already sends a signal to terminate an existing
+  coordinator process and it tries to restart one. But the coordinator
+  should then start recovery and only allow other backends after that.
+
+  Keep in mind that this recovery process is costly and we should somehow
+  prevent nodes which fail repeatedly from endlessly consuming resources
+  of the complete cluster.
+
+* The backends need to report errors from remote *and* local transactions
+  to the coordinator. Worker backends erroring out while waiting for
+  changesets are critical. Erroring out due to serialization failure is fine,
+  we can simply ignore the changeset, once it arrives late. But other errors
+  are probably pretty bad at that stage. Upon crashes, the postmaster
+  restarts all backends and the coordinator anyway, so the backend
+  process itself can take care of informing the coordinator via
+  imessages.
+
+
+3.2.3 Group Communication System Issues
+=======================================
+
+* Maybe drop the static receive buffers of the GCS interfaces in favor of a
+  dynamic one, it would make things a lot easier. OTOH writing directly to
+  an IMessage in shared memory is also tempting.
+
+* Hot swapping of the underlying GCS of a replicated database is currently
+  not supported. It would involve waiting for all nodes of the group to
+  have joined the new group, then swap.
+
+* Better error reporting to the client in case of GCS errors. There are
+  three phases: connecting, initialization and joining the group, all of which
+  can potentionally fail.
+
+* Complete the spread interface, implement parsing of the replication_gcs
+  GUC for spread, etc..
+
+
+3.3.1 Group Communication Services
+==================================
+
+* Prevent EGCS from sending an initial view which does not include the
+  local node.
+
+* Complete support for Spread
+
+* Support for Appia, or OpenAIS?
+
+
+3.3.2 Global Object Identifiers
+===============================
+
+* Use a naming service translating local OIDs to global ids, so that we
+  don't have to send the full schema and table name every time.
+
+  This would also make renaming of relations a lot easier, as the global
+  id could just stay the same.
+
+
+3.3.3 Global Transaction Identifiers
+====================================
+
+* Drop COIDs in favor of GIDs
+
+
+3.4 Collection of Transactional Data Changes
+============================================
+
+* Move the CurrentChangeSet global into a member of es_result_relation_info.
+  Required to handle nodeModifyTable's es_result_relations correctly: those
+  commands can affect multiple underlying relations (inherited), so we need
+  to be able to fill multiple change sets for distinct relations concurrently.
+
+* Make sure we correctly serialize transactions, which modify tuples that
+  are referenced by a foreign key. An insert or update to a tuple with a
+  reference to somewhere must make sure the referenced tuple didn't change
+  in a way that violates the foreign key. Otherwise this must be treated
+  as a conflict and resolved according to the GCS decided ordering.
+
+  (The other way around should be covered automatically by the changeset,
+  because it also catches changes by the ON UPDATE or ON DELETE hooks of
+  the affected foreign key).
+
+* Think about removing these additional members of the EState:
+  es_allLocksGranted, es_tupleChangeApplied and es_loopCounter. Those can
+  certainly be simplified.
+
+* Take care of a correct READ COMMITTED mode, which requires changes of a
+  committed transaction to be visible immediately to all other concurrently
+  running transactions. This might be very similar to a fully synchronous,
+  lock based replication mode and certainly introduces higher latency.
+
+* Add the schema name to the changeset and seq_increment messages to fully
+  support namespaces.
+
+
+3.6 Application of Change Sets
+==============================
+
+* Possibly limit ExecOpenIndices() to open only the primary key index for
+  CMD_DELETE?
+
+* Respect UNIQUE indices: violations must detect the conflict and respect
+  the GCS decided ordering.
+
+* For SERIALIZABLE transaction isolation level, it's sufficient to transmit
+  the single snapshot taken and require that to available at remote nodes.
+  However, in READ COMMITTED level, every command may acquire a new
+  snapshot, which we must make sure to transmit and wait for on remote nodes
+  as well.
+
+* Check if ExecInsertIndexTuples() could break due to out of sync replica
+  with UNIQUE constraint violations.
+
+* Fix the retry loop to allow a 2-stage optimistic application: in case
+  two transactions conflict, but none of the two got an ordering decision,
+  we need to defer aborting one of the two transactions. Thus at least a
+  2 stage application process is required. (Maybe more, if we don't try
+  to "steal" a tuple from a transaction that is to be aborted).
+
+* Prevent possible deadlocks which might occur by re-ordered (optimistic)
+  application of change sets from remote transactions. Just make sure the
+  next transaction according to the decided ordering always has a spare
+  helper backend available to get executed on and is not blocked by other
+  remote transactions which must wait for it (and thus cause deadlocking).
+
+
+3.8.2 Data Definition Changes
+=============================
+
+* Add proper handling of CREATE / ALTER / DROP TABLE and make sure those
+  don't interfere with normal, parallel changeset application.
+
+
+3.9 Initialization and Recovery
+===============================
+
+* helper processes connected to template databases should exit immediately
+  after having performed their job, so CREATE DATABASE from such a
+  template database works again.
+
+
+3.9.1 Initialization and Recovery: Data Transfer
+================================================
+
+
+3.9.2 Initialization and Recovery: Schema Adaption
+==================================================
+
+* Implement schema adaption
+
+* Make sure triggers and constraints either do only contain functions
+  which are available on every node _or_ execute the triggers and check the
+  constraints only on the machines having them (remote execution?)
+
+
+3.9.5 Initialization and Recovery: Full Cluster Shutdown and Restart
+====================================================================
+
+* After a full crash (no majority running, thus stopped cluster wide
+  operation), we need to be able to recover from the distributed,
+  permanent storage into a consistent state. This requires nodes
+  communicating their recently committed transactions, which didn't
+  make it to the other nodes before the crash.
+
+
+
+
+Cleanup
+=======
+
+* check for places that need an additional check for replication_enabled
+
+* merge co_database::state into the group::nodes->state, and the
+  main_state into main_group::nodes->state. Add a simpler routine to
+  retrieve the local node.
+
+* Cleanup the "node_id_self_ref" mess. The GCS should not be able to send
+  a viewchange to the coordinator, which does not include the local node
+  itself. In that sense, maybe "nodes" doesn't need to include the local
+  node?
+
+* Reduce the amount of elog(DEBUG...) to a usefull level. Currently mainly
+  DEBUG3 is used, sometimes DEBUG5. Maybe also rethink the precompiler
+  flags which enable or disable this verbose debugging.
+
+* At the moment, exec_simple_query is exported to the replication code,
+  where in stock Postgres, that call is static.
+
+* Same applies for ExecInsert, which is no longer static, but also used
+  in the recovery code. However, that should be mixed into
+  ExecProcessCollection() to reduce code duplication anyway.
+
+* The recovery subscriber currently issues a CREATE DATABASE from within
+  a transaction block. That's unclean.
+
+* The database encoding is transferred as a number, not string.
+

@@ -1,0 +1,37 @@
+Postgres-R has been initiated in the context of the DRAGON project at
+ETH Zürich, Switzerland. Bettina Kemme and Gustavo Alonso wrote the famous
+paper "Don't be lazy, be consistent", which they published in september 2000
+at the International Conference on Very Large Databases in Cairo, Egypt.
+It proves it is possible to circumvent high deadlock rates and poor response
+times even in syncronous, multi-master replication systems. They found the
+perfect basis for their work in Postgres, version 6.4.2 at that time.
+
+The main contributors of this prove of concept were: 
+
+		Win Bausch  (bausch@inf.ethz.ch)
+		Michael Baumer (baumer@inf.ethz.ch)
+		Ignaz Bachmann
+		Bettina Kemme (kemme@cs.mcgill.ca))
+
+
+Around may 2001 Darren Johnson (darren@up.hrcoxmail.com) and others have
+started to integrate Postgres-R into Postgres version 7.2. They concentrated
+on master-slave replication with failover support. Unfortunately that
+project got stuck and did not keep up with the development of Postgres.
+
+
+Since 2002 Markus Wanner has been working on Postgres-R. He concentrated
+on multi-master replication again and based his work on both previous
+projects. In July 2006 he presented his work at the 10th Anniversary
+Summit of Postgres in Toronto. In July 2008 he released the source code
+to the public.
+
+
+The Postgres Clustering Meeting in Tokyo, 2009 gave further inspiration and
+lead to the decision to split the existing Postgres-R patch into several sub-
+projects to ease review and maybe allow others to benefit from the work done
+for Postgres-R.
+
+
+Markus Wanner <markus@bluegap.ch>, January 2010
+

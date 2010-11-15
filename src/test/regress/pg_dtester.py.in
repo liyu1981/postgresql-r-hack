@@ -1,0 +1,2684 @@
+#!/usr/bin/python
+
+#-------------------------------------------------------------------------
+#
+# dtester.py.in
+#
+#	 Based on the sample test suite, but lots of tests for Postgres-R
+#	 have been added.
+#
+# Portions Copyright (c) 2010, Translattice, Inc
+# Portions Copyright (c) 2006-2010, PostgreSQL Global Development Group
+#
+#-------------------------------------------------------------------------
+
+import re, os, sys, threading, getopt, signal, copy, time, struct
+from collections import deque
+from twisted.internet import reactor, protocol, defer, threads
+
+from dtester.events import EventMatcher, EventSource, Event, \
+	ProcessOutputEvent, ProcessErrorEvent, ProcessEndedEvent
+from dtester.exceptions import TestAborted, TestFailure
+from dtester.test import TestSuite, BaseTest, SyncTest
+from dtester.reporter import CursesReporter
+from dtester.runner import Runner, Timeout
+
+suiteTimeout = 120
+testTimeout = 60
+
+
+# ******  emulated group communication system  ******************************
+
+class EgcsEvent(Event):
+	name = 'egcs'
+
+	def __init__(self, source, msg):
+		Event.__init__(self, source)
+		self.msg = msg
+
+	def __repr__(self):
+		return "[%s] egcs: %s" % (self.source, self.msg)
+
+class EGCS(protocol.Protocol):
+
+	def __init__(self, factory, node_id):
+		self.factory = factory
+		self.node_id = node_id
+		self.disconnected = 0
+		self.buffer = ''
+
+	def getNodeId(self):
+		return self.node_id
+
+	def __repr__(self):
+		return "node %d" % self.node_id
+
+	def connectionMade(self):
+		pass
+
+	def connectionLost(self, reason):
+		self.disconnected = 1
+		self.factory.removeNode(self, reason)
+
+	def dataReceived(self, data):
+		self.buffer += data
+		while self.processMessage():
+			pass
+
+	def processMessage(self):
+		""" Tries to process a message from the buffer, returns true on
+			success or false if there's no complete message in the buffer.
+		"""
+		data = self.buffer
+		if len(data) < 2:		 # no message type has less than 2 bytes
+			return False
+
+		if data[0] == 'H':
+			# a hello message.
+			proto_version = struct.unpack('!B', data[1])[0]
+
+			if proto_version == 1:
+				data = ''
+				raise Exception(
+					"EGCS Protocol Version 1 no longer supported.")
+ 
+			elif proto_version == 2:
+				msg = struct.pack('!cBi', 'H', 2, self.getNodeId())
+				self.transport.write(msg)
+
+				self.buffer = self.buffer[2:]
+				return True
+
+			else:
+				raise Exception("Invalid protocol version")
+
+		elif data[0] == 'J':
+			strlen = struct.unpack('!B', data[1])[0]
+
+			if len(data) < strlen + 2:
+				return False
+
+			group_name = struct.unpack('!%ds' % strlen, data[2:2+strlen])[0]
+
+			self.factory.join(self, group_name)
+
+			self.buffer = self.buffer[strlen+2:]
+			return True
+
+		elif data[0] == 'L':
+			strlen = struct.unpack('!B', data[1])[0]
+
+			if len(data) < strlen + 2:
+				return False
+
+			group_name = struct.unpack('!%ds' % strlen, data[2:2+strlen])[0]
+
+			self.factory.leave(self, group_name)
+
+			self.buffer = self.buffer[strlen+2:]
+			return True
+
+		elif data[0] == 'M':
+			if len(data) < 6:
+				return False
+
+			node_id = struct.unpack('!i', data[1:5])[0]
+
+			if node_id != self.node_id:
+				raise Exception("%s cannot send message for node %d" \
+					% (self, node_id))
+
+			strlen = struct.unpack('!B', data[5])[0]
+
+			if len(data) < 6  + strlen + 4:
+				return False
+
+			group_name = struct.unpack('!%ds' % strlen, data[6:6+strlen])[0]
+
+			msg_size = struct.unpack('!i', data[6+strlen:6+strlen+4])[0]
+
+			if len(data) < 6 + strlen + 4 + msg_size:
+				return False
+
+			msg_data = data[6+strlen+4:6+strlen+4+msg_size]
+			assert len(msg_data) == msg_size
+
+			self.factory.sendGroupMsg(node_id, group_name, msg_data)
+
+			self.buffer = self.buffer[6+strlen+4+msg_size:]
+			return True
+
+		elif data[0] == 'm':
+			if len(data) < 9:
+				return False
+
+			sender_node_id = struct.unpack('!i', data[1:5])[0]
+			recp_node_id = struct.unpack('!i', data[5:9])[0]
+
+			if sender_node_id != self.node_id:
+				raise Exception("%s cannot send messagen for node %d" \
+					% (self, sender_node_id))
+
+			strlen = struct.unpack('!B', data[9])[0]
+
+			if len(data) < 9 + strlen + 4:
+				return False
+
+			group_name = struct.unpack('!%ds' % strlen, data[10:10+strlen])[0]
+
+			msg_size = struct.unpack('!i', data[10+strlen:10+strlen+4])[0]
+
+			if len(data) < 9 + strlen + 4 + msg_size:
+				return False
+
+			msg_data = data[10+strlen+4:10+strlen+4+msg_size]
+			assert(len(msg_data) == msg_size)
+
+			self.factory.sendNodeMsg(sender_node_id, group_name, recp_node_id, msg_data)
+
+			self.buffer = self.buffer[10+strlen+4+msg_size:]
+			return True
+
+		else:
+			raise Exception("EGCS cannot handle message type '%s' (%d)" % \
+				(data[0], ord(data[0])) +
+				"from node id %d" % (self.node_id,))
+			self.transport.loseConnection()
+			data = ''
+
+class EGCSFactory(protocol.Factory):
+
+	def __init__(self, parent):
+		self.parent = parent
+		self.last_node_id = 0
+		self.nodes = []
+		self.groups = {}
+
+	def getNodeById(self, node_id):
+		for node in self.nodes:
+			if node.getNodeId() == node_id:
+				return node
+		raise KeyError, "no node with id %d" % node_id
+
+	def sendNode(self, node, msg):
+		if not node.disconnected:
+			node.transport.write(msg)
+
+	def sendGroup(self, group, msg):
+		for node in group:
+			self.sendNode(node, msg)
+
+	def sendGroupMsg(self, node_id, group_name, msg):
+		group = self.groups[group_name]
+		node = None
+		try:
+			node = self.getNodeById(node_id)
+		except KeyError, e:
+			self.parent.throwEvent(EgcsEvent, "WARNING: ignoring message from unknown node %d" % ( \
+				node_id,))
+			print "WARNING: ignoring message from unknown node %d" % node_id
+			return
+
+		self.parent.throwEvent(EgcsEvent, "%s sends a message to group %s of size %d" % ( \
+				node, group_name, len(msg)))
+
+		msg = struct.pack('!ciB%dsi%ds' % (len(group_name), len(msg)),
+			'M', node.getNodeId(), len(group_name), group_name,
+			len(msg), msg)
+
+		self.sendGroup(group, msg)
+
+	def sendNodeMsg(self, from_node_id, group_name, to_node_id, msg):
+		from_node = to_node = None
+		try:
+			from_node = self.getNodeById(from_node_id)
+		except KeyError, e:
+			self.parent.throwEvent(EgcsEvent, "WARNING: ignoring message from unknown node %d" % ( \
+				from_node_id))
+			print "WARNING: ignoring message from unknown node %d" % from_node_id
+			return
+
+		try:
+			to_node = self.getNodeById(to_node_id)
+		except KeyError, e:
+			self.parent.throwEvent(EgcsEvent, "WARNING: ignoring message from %d to unknown node %d" % ( \
+				from_node_id, to_node_id))
+			print "WARNING: ignoring message from %d to unknown node %d" % (from_node_id, to_node_id)
+			return
+
+		self.parent.throwEvent(EgcsEvent, "%s sends a message to %s of size %d" % ( \
+				from_node, to_node, len(msg)))
+
+		msg = struct.pack('!ciiB%dsi%ds' % (len(group_name), len(msg)),
+			'm', from_node.getNodeId(), to_node.getNodeId(),
+			len(group_name), group_name, len(msg), msg)
+
+		self.sendNode(to_node, msg)
+
+	def join(self, node, group_name):
+		self.parent.throwEvent(EgcsEvent,
+			"%s joins group %s" % (node, group_name))
+
+		if not self.groups.has_key(group_name):
+			self.groups[group_name] = []
+
+		group = self.groups[group_name]
+
+		# send the initial view of the group
+		for n in group:
+			msg = struct.pack('!cciB%ds' % len(group_name), 'V', 'I', n.getNodeId(), len(group_name), group_name)
+			self.sendNode(node, msg)
+
+		group.append(node)
+
+		# send a viewchange message
+		msg = struct.pack('!cciB%ds' % len(group_name), 'V', 'J', node.getNodeId(), len(group_name), group_name)
+		self.sendGroup(group, msg)
+
+	def leave(self, node, group_name):
+		self.parent.throwEvent(EgcsEvent,
+			"%s leaves group %s" % (node, group_name))
+
+		# get the group in quesion
+		if not self.groups.has_key(group_name):
+			raise ValueError, "%s is not in group %s" % (node, group_name)
+		group = self.groups[group_name]
+
+		# send a viewchange message
+		msg = struct.pack('!cciB%ds' % len(group_name), 'V', 'L', node.getNodeId(), len(group_name), group_name)
+		self.sendGroup(group, msg)
+
+		# remove the node
+		group.remove(node)
+
+	def removeNode(self, node, reason):
+		self.parent.throwEvent(EgcsEvent,
+			"%s has disconnected: %s" % (
+				node, reason.getErrorMessage()))
+
+		for group_name, group in self.groups.iteritems():
+			if node in group:
+				self.leave(node, group_name)
+
+		self.nodes.remove(node)
+
+	def buildProtocol(self, addr):
+		self.last_node_id += 1
+		proto = EGCS(self, self.last_node_id)
+		self.nodes.append(proto)
+		return proto
+
+	def stopFactory(self):
+
+		# print 'shutdown: notifying connected nodes'
+		for group_name, group in self.groups.iteritems():
+			for node in group:
+				self.leave(node, group_name)
+
+		for node in self.nodes:
+			node.transport.loseConnection()
+
+		protocol.Factory.stopFactory(self)
+
+class Egcs(EventSource):
+
+	def start(self, dport=54320):
+		self.factory = EGCSFactory(self)
+		reactor.listenTCP(dport, self.factory)
+
+	def stop(self):
+		self.factory.stopFactory()
+		self.throwEvent(ProcessEndedEvent, 0)
+
+	def __repr__(self):
+		return "egcs"
+
+
+# ******  definition of tests and suites  ***********************************
+
+class InstallationSuite(TestSuite):
+
+	setUpDescription = "creating temporary installation"
+	tearDownDescription = "removing temporary installation"
+
+	needs = (('shell', "IShell or something"),)
+
+	def setUp(self):
+		# inherit getConfig from the shell
+		setattr(self, 'getConfig', self.shell.getConfig)
+		setattr(self, 'runCommand', self.shell.runCommand)
+		setattr(self, 'recursive_remove', self.shell.recursive_remove)
+
+		# (re) create an installation directory
+		self.pg_inst_dir = self.shell.getConfig('inst_dir')
+		if os.path.exists(self.pg_inst_dir):
+			self.shell.recursive_remove(self.pg_inst_dir)
+		os.makedirs(self.pg_inst_dir)
+
+		# install into that directory
+		proc = self.shell.runCommand('make', 'make',
+			args=['make', '-C', self.shell.getConfig('top-builddir'),
+				  'DESTDIR=%s' % self.pg_inst_dir, 'install',
+				  'with_perl=no', 'with_python=no'],
+			lineBasedOutput=True)
+
+		d = self.waitFor(proc, EventMatcher(ProcessEndedEvent))
+		d.addCallback(self.makeTerminated)
+		proc.start()
+
+		# FIXME: how to properly handle these?
+		self.shell.addEnvPath(self.shell.getConfig('bindir'))
+		self.shell.addEnvLibraryPath(self.shell.getConfig('libdir'))
+		return d
+
+	def makeTerminated(self, event):
+		if event.exitCode != 0:
+			raise Exception("Initdb returned %d" % event.exitCode)
+		else:
+			return True
+
+	def tearDown(self):
+		# The installation procedure should be able to simply override any
+		# formerly installed files, so we save the time to clean up the
+		# installation directory.
+		return
+
+
+class InitdbSuite(TestSuite):
+
+	args = (('number', int), )
+	needs = (('shell', "IShell or something"),)
+
+	def setUpDescription(self):
+		return "initializing database system %d" % self.number
+
+	def tearDownDescription(self):
+		return "removing database system %d" % self.number
+
+	def getNumber(self):
+		return self.number
+
+	def getDir(self):
+		return self.dbdir
+
+	def setUp(self):
+		self.dbdir = "%s%d" % \
+			(self.shell.getConfig('pgdata_prefix'), self.number)
+		proc = self.shell.runCommand(
+				'initdb-%d' % self.number,
+				'initdb', args = [
+				'initdb', '-D', self.dbdir,
+				'-A', 'trust', '--noclean'],
+				lineBasedOutput=True)
+
+		d = defer.Deferred()
+		proc.addHook(EventMatcher(ProcessEndedEvent),
+					 self.initdb_terminated, d)
+		proc.start()
+		return d
+
+	def initdb_terminated(self, event, d):
+		if event.exitCode != 0:
+			d.errback(Exception("Initdb returned %d" % event.exitCode))
+		else:
+			d.callback(True)
+
+	def tearDown(self):
+		self.shell.recursive_remove(
+			"%s%d" % (self.shell.getConfig('pgdata_prefix'), self.number))
+
+class InitdbCopySuite(TestSuite):
+
+	args = (('number', int), )
+	needs = (('parent', "IDatabaseDir"),
+			 ('shell', "IShell or something"),)
+
+	def setUpDescription(self):
+		return "copying database system from %d to %d" % ( \
+			self.parent.getNumber(), self.number)
+
+	def tearDownDescription(self):
+		return "removing database system %d" % self.number
+
+	def getNumber(self):
+		return self.number
+
+	def getDir(self):
+		return self.dbdir
+
+	def setUp(self):
+		self.dbdir = "%s%d" % \
+			(self.shell.getConfig('pgdata_prefix'), self.number)
+		proc = self.shell.runCommand(
+				'db-copy-%d' % self.number,
+				'cp', args = [
+				'cp', '-a', self.parent.getDir(), self.dbdir],
+				lineBasedOutput=True)
+
+		d = defer.Deferred()
+		proc.addHook(EventMatcher(ProcessEndedEvent),
+					 self.copy_terminated, d)
+		proc.start()
+		return d
+
+	def copy_terminated(self, event, d):
+		if event and event.exitCode != 0:
+			d.errback(Exception("cp returned %d" % event.exitCode))
+		else:
+			d.callback(True)
+
+	def tearDown(self):
+		self.shell.recursive_remove(
+			"%s%d" % (self.shell.getConfig('pgdata_prefix'), self.number))
+
+class PostgresConfigAppender(TestSuite):
+
+	args = (('config', str), )
+	needs = (('dbdir', "IDatabaseDir"),)
+
+	def setUpDescription(self):
+		return "appending to postgresql.conf"
+
+	def tearDownDescription(self):
+		return "config appender no-op"
+
+	def getNumber(self):
+		return self.dbdir.getNumber()
+
+	def getDir(self):
+		return self.dbdir.getDir()
+
+	def setUp(self):
+		f = open(os.path.join(self.dbdir.getDir(), "postgresql.conf"), "a")
+		f.write(self.config)
+		f.close()
+
+	def tearDown(self):
+		pass
+
+class EgcsSuite(TestSuite):
+
+	args = (('logger', object),)
+
+	def setUpDescription(self):
+		return "starting EGCS"
+
+	def tearDownDescription(self):
+		return "stopping EGCS"
+
+	def setUp(self):
+		self.egcs = Egcs()
+		self.egcs.addHook(EventMatcher(EgcsEvent), self.logger.callback)
+		self.egcs.start()
+
+	def tearDown(self):
+		d = defer.Deferred()
+		self.egcs.addHook(EventMatcher(ProcessEndedEvent),
+				  lambda event: d.callback(None))
+		self.egcs.stop()
+		return d
+
+class PostmasterSuite(TestSuite):
+
+	needs = (('shell', "IShell or something"),
+			 ('dbdir', "IDatabaseDir"),)
+
+	def setUpDescription(self):
+		return "starting database system %d" % self.dbdir.getNumber()
+
+	def tearDownDescription(self):
+		return "stopping database system %d" % self.dbdir.getNumber()
+
+	def getPort(self):
+		return self.port
+
+	def setUp(self):
+		setattr(self, 'getNumber', self.dbdir.getNumber)
+
+		self.port = self.shell.getConfig('temp-port') + self.dbdir.getNumber()
+
+		args = ['postmaster', '-d5',
+				'-D', self.dbdir.getDir(),
+				'-i', '-p', str(self.port)]
+
+		if self.shell.getConfig('enable_cassert'):
+			args += "-A1"
+
+		self.postmaster = self.shell.runCommand(
+			'postmaster%d' % self.dbdir.getNumber(),
+			'postmaster',
+			args = args,
+			lineBasedOutput=True)
+
+		d = defer.Deferred()
+		self.readyHook = \
+			self.postmaster.addHook(EventMatcher(ProcessErrorEvent,
+				"database system is ready to accept connections"),
+				self.postmaster_ready, d)
+
+		self.unexpectedTerminationHook = \
+		  self.postmaster.addHook(EventMatcher(ProcessEndedEvent),
+								  self.postmaster_terminated)
+		self.postmaster.start()
+		return d
+
+	def postmaster_ready(self, event, d):
+		# it's sufficient if we're called once
+		self.postmaster.removeHook(self.readyHook)
+		d.callback(None)
+
+	def postmaster_terminated(self, event):
+		exitCode = 'undef'
+		if hasattr(event, 'exitCode'):
+			exitCode = event.exitCode
+		elif hasattr(event, 'data'):
+			exitCode = repr(event.data)
+		self.abort("postmaster %d unexpectedly terminated (exit code %s)" % \
+			(self.dbdir.getNumber(), exitCode))
+
+	def tearDown(self):
+		self.postmaster.removeHook(self.unexpectedTerminationHook)
+		if not self.aborted:
+			d = defer.Deferred()
+			self.postmaster.addHook(EventMatcher(ProcessEndedEvent),
+									lambda event: d.callback(None))
+			self.postmaster.stop()
+			return d
+		else:
+			return True
+
+
+class TestDatabaseSuite(TestSuite):
+
+	args = (('dbname', str),)
+	needs = (('shell', "IShell or something"),
+			 ('pg', "IPostmaster"),)
+
+	def setUpDescription(self):
+		return "creating database %s at server %d" % \
+						(self.dbname, self.pg.getNumber())
+
+	def tearDownDescription(self):
+		return "not (!) dropping database %s at server %d" % \
+						(self.dbname, self.pg.getNumber())
+
+	def getDbname(self):
+		return self.dbname
+
+	def setUp(self):
+		setattr(self, "getPort", self.pg.getPort)
+		setattr(self, "getNumber", self.pg.getNumber)
+
+		self.proc = self.shell.runCommand(
+			'createdb%d' % self.pg.getNumber(),
+			'createdb',
+			args = ['createdb',
+					'-p', str(self.getPort()), self.dbname],
+			lineBasedOutput=True)
+
+		d = defer.Deferred()
+		self.proc.addHook(EventMatcher(ProcessEndedEvent),
+						  self.createdb_terminated, d)
+		self.proc.start()
+		return d
+
+	def createdb_terminated(self, event, d):
+		if event.exitCode != 0:
+			d.errback(Exception("createdb terminated with code %d" % \
+				event.exitCode))
+		else:
+			d.callback(None)
+
+	def tearDown(self):
+		if self.pg.aborted:
+			return True
+
+		# Hm.. this interferes with the postmaster suites, which need
+		# to be started and stopped several times on top of a test database,
+		# however, creating and dropping it certainly depends on a running
+		# postmaster. Not sure how to solve this, at the moment I'm just
+		# skipping cleanup, i.e. dropdb.
+		return True
+
+		self.proc = self.shell.runCommand(
+			'dropdb%d' % self.pg.getNumber(),
+			'dropdb',
+			args = ['dropdb',
+					'-p', str(self.getPort()), self.dbname],
+			lineBasedOutput=True)
+
+		d = defer.Deferred()
+		self.proc.addHook(EventMatcher(ProcessEndedEvent),
+						  self.dropdb_terminated, d)
+		self.proc.start()
+		return d
+
+	def dropdb_terminated(self, event, d):
+		if event.exitCode != 0:
+			d.errback(Exception("dropdb returned with %d" % \
+				event.exitCode))
+		else:
+			d.callback(None)
+
+class TestDatabaseDirectory(BaseTest):
+
+	description = "database directory"
+
+	needs = (('dbdir', "IDatabaseDir"),)
+
+	def run(self):
+		pgdata = self.dbdir.getDir()
+		assert os.path.exists(pgdata)
+		assert os.path.isdir(pgdata)
+		assert os.path.exists(os.path.join(pgdata, 'PG_VERSION'))
+		assert os.path.isdir(os.path.join(pgdata, 'base'))
+
+class SqlConnectionSuite(TestSuite):
+
+	args = (('dbname', str),)
+	needs = (('shell', "IShell or something"),
+			 ('db', "IPostmaster"))
+
+	def setUpDescription(self):
+		return "connecting to database %s at server %d" % \
+						(self.dbname, self.db.getNumber())
+	def tearDownDescription(self):
+		return "disconnecting from database %s at server %d" % \
+						(self.dbname, self.db.getNumber())
+
+	def getDbname(self):
+		return self.dbname
+
+	def setUp(self):
+		self.psql = self.shell.runCommand(
+			'psql%d' % self.db.getNumber(),
+			'psql',
+			args=['psql', '-AEnX',
+				  '--pset=pager=off', '--pset=columns=0',
+				  '-p', str(self.db.getPort()),
+				  self.dbname])
+
+		# initialize the output buffer and attach a first output collector
+		# *before* the process is started.
+		self.output_buffer = ""
+		d = defer.Deferred()
+		self.outputCollectorDeferred = d
+		self.outputCollectorHook = self.psql.addHook(
+			EventMatcher(ProcessOutputEvent), self.outputCollector,
+			None, d)
+
+		# Mark as being in used, until we get to the commandline
+		self.inUse = True
+		self.workQueue = []
+		self.remainingQueryLines = None
+
+		# also add a termination hook
+		self.unexpectedTerminationHook = self.psql.addHook(
+			EventMatcher(ProcessEndedEvent), self.psql_terminated)
+
+		# then schedule start of the psql process and return the deferred
+		# *before* starting the process.
+		reactor.callLater(0.0, self.psql.start)
+		return d
+
+	def psql_terminated(self, event):
+		exitCode = "undef"
+		if hasattr(event, 'exitCode'):
+			exitCode = event.exitCode
+		elif hasattr(event, 'data'):
+			exitCode = repr(event.data)
+
+		# If there's an outputCollectorHook, the abort method won't catch
+		# and we have to wait for the timeout to trigger, instead of
+		# acting on process termination. We thus save the outputCollector
+		# deferred and send it an errback with the failure.
+		if self.outputCollectorHook:
+			self.outputCollectorDeferred.errback( \
+				TestAborted("psql to server %d unexpectedly terminated (exit code %s)" % ( \
+					self.db.getNumber(), exitCode)))
+		self.abort(
+			"psql to server %d unexpectedly terminated (exit code %s)" % ( \
+				self.db.getNumber(), exitCode))
+
+	def tearDown(self):
+		self.psql.removeHook(self.unexpectedTerminationHook)
+
+		d = defer.Deferred()
+		self.psql.addHook(EventMatcher(ProcessEndedEvent),
+						  lambda event: d.callback(None))
+		reactor.callLater(0.0, self.psql.write, "\\q\n")
+		reactor.callLater(5.0, self.psql.stop)
+		return d
+
+	def outputCollector(self, event, query, d):
+		self.output_buffer += event.data
+
+		cmdprompt = self.dbname + '=#'
+		restprompt = self.dbname + "-#"
+		restprompt2 = self.dbname + "$#"
+		restprompt3 = self.dbname + "(#"
+
+		cpos = self.output_buffer.find(cmdprompt)
+		cr1pos = self.output_buffer.find(restprompt)
+		cr2pos = self.output_buffer.find(restprompt2)
+		cr3pos = self.output_buffer.find(restprompt3)
+
+		if cr1pos >= 0 or cr2pos >= 0 or cr3pos >= 0:
+			assert(cpos < 0)
+			self.writeQueryLine()
+
+			cpos = cr1pos
+			if cr2pos > cr1pos:
+				cpos = cr2pos
+
+			if cr3pos > cpos:
+				cpos = cr3pos
+
+			self.output_buffer = self.output_buffer[cpos + len(cmdprompt):]
+
+		elif cpos >= 0:
+			self.psql.removeHook(self.outputCollectorHook)
+			self.outputCollectorHook = False
+			result = self.output_buffer[:cpos]
+			self.output_buffer = self.output_buffer[cpos + len(cmdprompt):]
+			if len(self.output_buffer) > 0 and self.output_buffer != ' ':
+				print "rest: %s" % repr(self.output_buffer)
+			if d:
+				# remove the command prompt at the end
+				result = result[:cpos]
+
+				# remove the first line, which is still
+				# part of the query
+
+				idx = result.find("\n")
+				if idx >= 0:
+					result = result[idx+1:]
+
+				reactor.callLater(0.0, d.callback, result)
+
+			self.inUse = False
+			if len(self.workQueue) > 0:
+				assert not self.inUse
+				job = self.workQueue.pop()
+				d1 = job['method'](*job['args'])
+				d1.chainDeferred(job['deferred'])
+
+	def query(self, query):
+		if self.inUse:
+			d = defer.Deferred()
+			self.workQueue.append({'deferred': d,
+								   'method': self.query,
+								   'args': (query,)})
+			return d
+
+		assert not self.inUse
+		assert not self.outputCollectorHook
+
+		self.inUse = True
+		self.output_buffer = ""
+		d = defer.Deferred()
+		self.outputCollectorHook = self.psql.addHook(
+			EventMatcher(ProcessOutputEvent), self.outputCollector, query, d)
+		d.addCallback(self.parseQueryResult)
+
+		self.remainingQueryLines = deque(query.split("\n"))
+		self.writeQueryLine()
+
+		return d
+
+	def parseQueryResult(self, result):
+		rawlines = result.split('\n')
+
+		lines = []
+		for line in rawlines:
+			line = line.strip()
+			if line.startswith("ERROR:"):
+				raise Exception(line)
+			elif line.startswith("WARNING:"):
+				continue  # FIXME: should probably save the warning
+			elif line.startswith("NOTICE:"):
+				continue  # FIXME: should probably save the notice
+			elif line.startswith("ROLLBACK"):
+				raise Exception("transaction rolled back (%s)" % query)
+			elif line.startswith("message type"):
+				raise Exception("protocol error: %s" % line)
+			if len(line) > 0:
+				lines.append(line)
+
+		try:
+			assert len(lines) >= 2
+
+			lines = map(lambda x: x.strip(), lines)
+			headLine = lines[0]
+			tailLine = lines[-1]
+
+			fields = headLine.split('|')
+			rows = []
+			for row in lines[1:-1]:
+				attrs = row.split('|')
+				assert len(attrs) == len(fields)
+				x = {}
+				for i in range(len(attrs)):
+					x[fields[i]] = attrs[i].strip()
+				rows.append(x)
+
+			x = re.compile("\((\d+) rows?\)").search(tailLine)
+			if x:
+				if not int(x.group(1)) == len(rows):
+					raise Exception("number of rows doesn't match: %s vs %d for: '%s'" % (
+						x.group(1), len(rows), lines))
+			else:
+				raise Exception("final number of rows line doesn't match.\n------------\n%s\n---------------\n" % lines)
+			return rows
+		except Exception, e:
+			import traceback
+			print "error parsing query result: %s" % e
+			traceback.print_exc()
+			raise e
+			# return []
+
+	def operation(self, query, expResult=None):
+		if self.inUse:
+			d = defer.Deferred()
+			self.workQueue.append({'deferred': d,
+								   'method': self.operation,
+								   'args': (query, expResult)})
+			return d
+
+		assert not self.inUse
+		assert not self.outputCollectorHook
+
+		self.inUse = True
+		self.output_buffer = ""
+		d = defer.Deferred()
+		self.outputCollectorDeferred = d
+		self.outputCollectorHook = self.psql.addHook(
+			EventMatcher(ProcessOutputEvent), self.outputCollector, query, d)
+		d.addCallback(self.checkQueryResult, expResult)
+
+		self.remainingQueryLines = deque(query.split("\n"))
+		self.writeQueryLine()
+
+		return d
+
+	def writeQueryLine(self):
+		# defer writing to the process, so that the caller has the
+		# opportunity to add callbacks to the deferred we return.
+		if len(self.remainingQueryLines) > 0:
+			line = self.remainingQueryLines.popleft()
+		else:
+			line = ""
+
+       		reactor.callLater(0.0, self.psql.write, line + "\n")
+
+	def checkQueryResult(self, result, expResult):
+		lines = []
+		for line in result.split("\n"):
+			line = line.strip()
+			if len(line) > 0 and not line.startswith("WARNING:") \
+							 and not line.startswith("NOTICE:"):
+				lines.append(line)
+		lines = "\n".join(lines)
+		if expResult:
+			if isinstance(expResult, str):
+				self.assertEqual(expResult, lines, "didn't get expected result")
+			elif isinstance(expResult, list):
+				if not lines in expResult:
+					raise TestFailure("didn't get expected result",
+									   "no result matches, got:\n%s\n\n" % lines)
+		return lines
+
+
+class TestDatabaseConnection(BaseTest):
+
+	needs = (('conn', "ISqlConnection"),)
+
+	description = "database connection"
+
+	def run(self):
+		return self.conn.query("SELECT 1 AS test;")
+
+
+# FIXME: that's not actually a test, but it modifies the database state
+class PopulateTestDatabase(BaseTest):
+
+	needs = (('conn', "ISqlConnection"),)
+
+	description = "populate test database"
+
+	def run(self):
+		conn = self.conn
+
+		conn = self.conn
+
+		# Create a test table for use in TestConcurrentUpdates and fill it
+		# with two test tuples.
+		d = conn.operation("CREATE TABLE test (i int PRIMARY KEY, t text);",
+						   "CREATE TABLE")
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO test VALUES (5, 'apple');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO test VALUES (7, 'pear');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO test VALUES (11, 'banana');",
+			"INSERT 0 1"))
+
+		# Add other stuff required to test Postgres-R
+		d.addCallback(lambda x: conn.operation(
+			"CREATE SEQUENCE testseq_increment;", "CREATE SEQUENCE"))
+		d.addCallback(lambda x: conn.operation(
+			"CREATE SEQUENCE testseq_assignment;",
+			"CREATE SEQUENCE"))
+		d.addCallback(lambda x: conn.operation(
+			"CREATE TABLE repl_test (i int PRIMARY KEY, t text);",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO repl_test VALUES (5, 'tuple to update');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO repl_test VALUES (8, 'tuple to delete');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO repl_test VALUES (14, 'tuple 1 for sp');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO repl_test VALUES (15, 'tuple 2 for sp');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"CREATE TABLE test_array_pkey_table (pk int4[] PRIMARY KEY, t text);",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"INSERT INTO test_array_pkey_table VALUES ('{8, 5}'::int[], 'test tuple');",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE FUNCTION perform_updates()
+  RETURNS integer AS $$
+BEGIN
+  UPDATE repl_test SET t = 'tuple 1 updated from function' WHERE i = 14;
+  DELETE FROM repl_test WHERE i = 15;
+  INSERT INTO repl_test (i, t) VALUES (16, 'inserted from function');
+  RETURN 1;
+END;
+$$ LANGUAGE plpgsql;""",
+			"CREATE FUNCTION"))
+
+
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE TABLE test_before_trigger_result_table (
+  id SERIAL PRIMARY KEY,
+  info TEXT);""",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE FUNCTION before_trigger_func()
+  RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'DELETE') THEN
+    INSERT INTO test_before_trigger_result_table (info)
+      VALUES ('deleting row ' || OLD.id);
+    RETURN OLD;
+  ELSIF (TG_OP = 'UPDATE') THEN
+    INSERT INTO test_before_trigger_result_table (info)
+      VALUES ('updating row ' || OLD.id);
+    NEW.info = 'newly updated row modified by trigger';
+    RETURN NEW;
+  ELSIF (TG_OP = 'INSERT') THEN
+    INSERT INTO test_before_trigger_result_table (info)
+      VALUES ('inserting new row');
+    NEW.info = 'newly inserted row modified by trigger';
+    RETURN NEW;
+  END IF;
+
+END;
+$$ LANGUAGE plpgsql;""",
+			"CREATE FUNCTION"))
+		d.addCallback(lambda x: conn.operation(
+			"CREATE TABLE test_before_trigger_table (id INT PRIMARY KEY, orig TEXT, info TEXT);",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_before_trigger_table (id, orig)
+			          VALUES (1, 'tuple to update');""",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_before_trigger_table (id, orig)
+			          VALUES (2, 'tuple to delete');""",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE TRIGGER test_before_trigger
+  BEFORE INSERT OR UPDATE OR DELETE ON test_before_trigger_table
+  FOR EACH ROW EXECUTE PROCEDURE before_trigger_func();""",
+			"CREATE TRIGGER"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE FUNCTION after_trigger_func()
+  RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'DELETE') THEN
+    INSERT INTO test_after_trigger_result_table (info)
+      VALUES ('at: deleted a row');
+  ELSIF (TG_OP = 'UPDATE') THEN
+    INSERT INTO test_after_trigger_result_table (info)
+      VALUES ('at: updated row ' || NEW.id);
+  ELSIF (TG_OP = 'INSERT') THEN
+    INSERT INTO test_after_trigger_result_table (info)
+      VALUES ('at: inserted row ' || NEW.id);
+  END IF;
+
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;""",
+			"CREATE FUNCTION"))
+		d.addCallback(lambda x: conn.operation(
+			"CREATE TABLE test_after_trigger_table (id INT PRIMARY KEY, orig TEXT, info TEXT);",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE TABLE test_after_trigger_result_table (
+  id SERIAL PRIMARY KEY,
+  info TEXT);""",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_after_trigger_table (id, orig)
+			          VALUES (1, 'tuple to update');""",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_after_trigger_table (id, orig)
+			          VALUES (2, 'tuple to delete');""",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE TRIGGER test_after_trigger
+  AFTER INSERT OR UPDATE OR DELETE ON test_after_trigger_table
+  FOR EACH ROW EXECUTE PROCEDURE after_trigger_func();""",
+			"CREATE TRIGGER"))
+
+		d.addCallback(lambda x: conn.operation(
+			"""CREATE TABLE test_unique_violation_table (
+  id INT PRIMARY KEY,
+  orig TEXT,
+  test_col INT UNIQUE NOT NULL
+);""",
+			"CREATE TABLE"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_unique_violation_table (id, orig, test_col)
+			          VALUES (1, 'left tuple for conflicting update', 7);""",
+			"INSERT 0 1"))
+		d.addCallback(lambda x: conn.operation(
+			"""INSERT INTO test_unique_violation_table (id, orig, test_col)
+			          VALUES (2, 'right tuple for conflicting update', 9);""",
+			"INSERT 0 1"))
+		return d
+
+class TestConnectToUnknownGCS(BaseTest):
+
+	description = "testing connection to unknown GCS"
+
+	needs = (('conn', "ISqlConnection"),)
+
+	def run(self):
+		return self.conn.operation(
+			"ALTER DATABASE test START REPLICATION IN GROUP test USING unknown_gcs;",
+			"ALTER DATABASE")
+
+
+class TestSimpleSequenceIncrement(SyncTest):
+
+	description = "simple sequence increment"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.query,
+			"SELECT nextval('testseq_increment');")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		time.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT last_value, is_called FROM testseq_increment;")
+		self.assertEqual(res1, [{'last_value': '1', 'is_called': 't'}],
+			"sequence info mismatch on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT last_value, is_called FROM testseq_increment;")
+		self.assertEqual(res2, [{'last_value': '1', 'is_called': 't'}],
+			"sequence info mismatch on second connection")
+
+
+class TestSimpleSequenceAssignment(SyncTest):
+
+	description = "simple sequence assignment"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(2, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(2, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.query,
+			"SELECT setval('testseq_assignment', 42);")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		time.sleep(1)
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT last_value, is_called FROM testseq_assignment;")
+		self.assertEqual(res1, [{'last_value': '42', 'is_called': 't'}],
+			"sequence info mismatch on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT last_value, is_called FROM testseq_assignment;")
+		self.assertEqual(res2, [{'last_value': '42', 'is_called': 't'}],
+			"sequence info mismatch on second connection")
+
+
+class Sleep(SyncTest):
+
+	descriptionn = "sleep"
+
+	args = (('count', int),)
+
+	def run(self):
+		self.sleep(self.count)
+
+class TestSimpleRowUpdateReplication(SyncTest):
+
+	description = "simple row update"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"UPDATE repl_test SET t = 'update succeeded' WHERE i = 5;",
+			"UPDATE 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i = 5;")
+		self.assertEqual(res1, [{'i': '5', 't': 'update succeeded'}],
+			"failed to update on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = 5;")
+		self.assertEqual(res2, [{'i': '5', 't': 'update succeeded'}],
+			"failed to update on second connection")
+
+class TestArrayRowUpdateReplication(SyncTest):
+
+	description = "array row update"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"UPDATE test_array_pkey_table SET t = 'update succeeded' WHERE pk = '{8, 5}'::int[];",
+			"UPDATE 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT pk, t FROM test_array_pkey_table WHERE pk = '{8, 5}'::int[];")
+		self.assertEqual(res1, [{'pk': '{8,5}', 't': 'update succeeded'}],
+			"failed to update on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT pk, t FROM test_array_pkey_table WHERE pk = '{8, 5}'::int[];")
+		self.assertEqual(res2, [{'pk': '{8,5}', 't': 'update succeeded'}],
+			"failed to update on second connection")
+
+class TestSimpleRowInsertReplication(SyncTest):
+
+	description = "simple row insert"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"INSERT INTO repl_test VALUES (17, 'inserted tuple');", "INSERT 0 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i = 17;")
+		self.assertEqual(res1, [{'i': '17', 't': 'inserted tuple'}],
+			"failed to insert on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = 17;")
+		self.assertEqual(res2, [{'i': '17', 't': 'inserted tuple'}],
+			"failed to insert on second connection")
+
+class TestSimpleRowDeleteReplication(SyncTest):
+
+	description = "simple row delete"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"DELETE FROM repl_test WHERE i = 8;", "DELETE 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i = 8;")
+		self.assertEqual(res1, [],
+			"failed to delete on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = 8;")
+		self.assertEqual(res2, [],
+			"failed to delete on second connection")
+
+class TestStoredProcedureChangeReplication(SyncTest):
+
+	description = "stored procedure changes"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.query,
+			"SELECT perform_updates() AS test;")
+
+		self.assertEqual(res, [{'test': '1'}],
+				 "result mismatch on database 1");
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(2)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i >= 14 AND i <= 16;")
+		self.assertEqual(res1, [{'i': '14',
+					 't': 'tuple 1 updated from function'},
+					{'i': '16',
+					 't': 'inserted from function'}],
+			"failed to update on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i >= 14 AND i <= 16;")
+		self.assertEqual(res2, [{'i': '14',
+					 't': 'tuple 1 updated from function'},
+					{'i': '16',
+					 't': 'inserted from function'}],
+			"failed to update on second connection")
+
+class TestSubtransactions(SyncTest):
+
+	description = "subtransactions"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"INSERT INTO repl_test (i, t) VALUES (20, 'sub 0');",
+			"INSERT 0 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"SAVEPOINT sp1;", "SAVEPOINT")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"INSERT INTO repl_test (i, t) VALUES (21, 'sub 1');",
+			"INSERT 0 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"ROLLBACK TO SAVEPOINT sp1;", "ROLLBACK")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"INSERT INTO repl_test (i, t) VALUES (22, 'sub 2');",
+			"INSERT 0 1")
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(2)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i >= 20 AND i <= 22;")
+		self.assertEqual(res1, [{'i': '20',
+					 't': 'sub 0'},
+					{'i': '22',
+					 't': 'sub 2'}],
+			"failed to update on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i >= 20 AND i <= 22;")
+		self.assertEqual(res2, [{'i': '20',
+					 't': 'sub 0'},
+					{'i': '22',
+					 't': 'sub 2'}],
+			"failed to update on second connection")
+
+class TestBeforeRowTrigger(SyncTest):
+
+	description = "before row trigger"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""INSERT INTO test_before_trigger_table (id, orig)
+			          VALUES (3, 'inserted tuple');""",
+			"INSERT 0 1")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""DELETE FROM test_before_trigger_table
+			          WHERE id = 2;""",
+			"DELETE 1")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""UPDATE test_before_trigger_table
+			          SET orig = 'updated tuple' WHERE id = 1;""",
+			"UPDATE 1")
+
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(2)
+
+		exp_base_data = [
+			{'id': '1', 'orig': 'updated tuple', 'info': 'newly updated row modified by trigger'},
+			{'id': '3', 'orig': 'inserted tuple', 'info': 'newly inserted row modified by trigger'}]
+
+		exp_trigger_data = [
+			{'info': 'inserting new row'},
+			{'info': 'deleting row 2'},
+			{'info': 'updating row 1'}]
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT id, orig, info FROM test_before_trigger_table
+                                   ORDER BY id;""")
+		self.assertEqual(res1, exp_base_data, 
+			"base data doesn't match on first connection")
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT info FROM test_before_trigger_result_table
+                                       ORDER BY id;""")
+		self.assertEqual(res1, exp_trigger_data,
+			"trigger data doesn't match on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"""SELECT id, orig, info FROM test_before_trigger_table
+                                   ORDER BY id;""")
+
+		self.assertEqual(res2, exp_base_data, 
+			"base data doesn't match on second connection")
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT info FROM test_before_trigger_result_table
+                                       ORDER BY id;""")
+		self.assertEqual(res1, exp_trigger_data,
+			"trigger data doesn't match on second connection")
+
+
+
+class TestAfterRowTrigger(SyncTest):
+
+	description = "after row trigger"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""INSERT INTO test_after_trigger_table (id, orig)
+			          VALUES (3, 'inserted tuple');""",
+			"INSERT 0 1")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""DELETE FROM test_after_trigger_table
+			          WHERE id = 2;""",
+			"DELETE 1")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"""UPDATE test_after_trigger_table
+			          SET orig = 'updated tuple' WHERE id = 1;""",
+			"UPDATE 1")
+
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(2)
+		exp_base_data = [
+			{'id': '1', 'orig': 'updated tuple'},
+			{'id': '3', 'orig': 'inserted tuple'}]
+
+		exp_trigger_data = [
+			{'info': 'at: inserted row 3'},
+			{'info': 'at: deleted a row'},
+			{'info': 'at: updated row 1'}]
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT id, orig FROM test_after_trigger_table
+                                   ORDER BY id;""")
+		self.assertEqual(res1, exp_base_data, 
+			"base data doesn't match on first connection")
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT info FROM test_after_trigger_result_table
+                                       ORDER BY id;""")
+		self.assertEqual(res1, exp_trigger_data,
+			"trigger data doesn't match on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"""SELECT id, orig FROM test_after_trigger_table
+                                   ORDER BY id;""")
+
+		self.assertEqual(res2, exp_base_data, 
+			"base data doesn't match on second connection")
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"""SELECT info FROM test_after_trigger_result_table
+                                       ORDER BY id;""")
+		self.assertEqual(res1, exp_trigger_data,
+			"trigger data doesn't match on second connection")
+
+
+class TestLargeCsetReplication(SyncTest):
+
+	description = "txn w/ lots of queries"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		ROWS = 1000
+		RANGE_START = 5000
+
+		for x in range(ROWS):
+			no = x + RANGE_START;
+			self.syncCall(5, self.conn1.operation,
+				      "INSERT INTO repl_test (i, t) VALUES (%d, 'text %d');" % (no, no)) 
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(1)
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i >= %d ORDER BY i;" % RANGE_START)
+		self.assertEqual(ROWS, len(res1),
+			"number of rows doesn't match on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i >= %d ORDER BY i;" % RANGE_START)
+		self.assertEqual(ROWS, len(res2),
+			"number of rows doesn't match on second connection")
+
+		self.assertEqual(res1[0], res2[0],
+			"first row of results doesn't match")
+
+
+class TestLargeCsetReplication2(SyncTest):
+
+	description = "txn w/ lots of modifications in a single query"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		ROWS = 1000
+		RANGE_START = 10000
+
+		for x in range(ROWS):
+			no = x + RANGE_START;
+			self.syncCall(5, self.conn1.operation,
+				      "INSERT INTO repl_test (i, t) VALUES (%d, 'text %d');" % (no, no)) 
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(3)
+
+
+
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		self.syncCall(5, self.conn1.operation,
+			      "UPDATE repl_test SET t = 'new text ' || i WHERE i >= %d AND i < %d;" % (RANGE_START, RANGE_START + ROWS),
+			      "UPDATE %d" % ROWS)
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(3)
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i >= %d ORDER BY i;" % RANGE_START)
+		self.assertEqual(ROWS, len(res1),
+			"number of rows doesn't match on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i >= %d ORDER BY i;" % RANGE_START)
+		self.assertEqual(ROWS, len(res2),
+			"number of rows doesn't match on second connection")
+
+		self.assertEqual(res1[0], res2[0],
+			"first row of results doesn't match")
+
+
+class TestLargeCsetReplication3(SyncTest):
+
+	description = "txn w/ single large tuple insert"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		TEST_ID = 11001
+		self.syncCall(5, self.conn1.operation,
+			      "INSERT INTO repl_test (i, t) VALUES (%d, repeat('deadbeef', 10000));" % TEST_ID)
+
+		self.syncCall(2, self.conn1.operation,
+			"COMMIT;", "COMMIT")
+
+		self.sleep(3)
+
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i = %d ORDER BY i;" % TEST_ID)
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = %d ORDER BY i;" % TEST_ID)
+		self.assertEqual(res1[0], res2[0],
+			"result mismatch")
+
+
+class TestUpdateConflict(SyncTest):
+
+	description = "update conflict"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		self.syncCall(5, self.conn1.operation,
+			"INSERT INTO repl_test VALUES (18, 'original tuple');",
+			"INSERT 0 1")
+		self.sleep(1)
+
+		# begin a transaction on both connections and try a conflicting
+		# update.
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		self.syncCall(2, self.conn2.operation,
+			"BEGIN;", "BEGIN")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		self.syncCall(2, self.conn1.operation,
+			"UPDATE repl_test SET t = 'update from conn1' WHERE i = 18;", "UPDATE 1")
+		self.syncCall(2, self.conn2.operation,
+			"UPDATE repl_test SET t = 'update from conn2' WHERE i = 18;", "UPDATE 1")
+
+		# commit the transaction on conn1 first
+		res = self.syncCall(5, self.conn1.operation, "COMMIT;")
+		self.assertEqual(res, "COMMIT",
+			"failed to commit first transaction")
+
+
+		# then try to commit the transaction on conn2, which should fail
+		res = self.syncCall(5, self.conn2.operation, "COMMIT;")
+		self.assertEqual("ERROR:  could not serialize transaction due to concurrent remote transaction", res,
+			"second transaction didn't get aborted, as expected")
+
+		self.syncCall(5, self.conn2.operation, "ROLLBACK;", "ROLLBACK")
+
+
+		# make sure the transaction above has been applied on db2
+		self.sleep(1)
+
+		# check the result
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT i, t FROM repl_test WHERE i = 18;")
+		self.assertEqual(res1, [{'i': '18', 't': 'update from conn1'}],
+			"unexpected result on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = 18;")
+		self.assertEqual(res2, [{'i': '18', 't': 'update from conn1'}],
+			"unexpected result on second connection")
+
+
+class TestInsertConflict(SyncTest):
+
+	description = "update conflict on unique constraint"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	TEST_ID = 19
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		# begin a transaction on both connections and try a conflicting
+		# update.
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		self.syncCall(2, self.conn2.operation,
+			"BEGIN;", "BEGIN")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		self.syncCall(2, self.conn1.operation,
+			"INSERT INTO repl_test (i, t) VALUES (%d, 'insert from node 1');" \
+			% self.TEST_ID, "INSERT 0 1")
+		self.syncCall(2, self.conn2.operation,
+			"INSERT INTO repl_test (i, t) VALUES (%d, 'insert from node 2');" \
+			% self.TEST_ID, "INSERT 0 1")
+
+		# commit the transaction on conn1 first
+		res = self.syncCall(5, self.conn1.operation, "COMMIT;")
+		self.assertEqual(res, "COMMIT",
+			"failed to commit first transaction")
+
+		# then try to commit the transaction on conn2, which should fail
+		res = self.syncCall(5, self.conn2.operation, "COMMIT;")
+		self.assertEqual("ERROR:  could not serialize transaction due to concurrent remote transaction", res,
+			"second transaction didn't get aborted, as expected")
+
+		self.syncCall(5, self.conn2.operation, "ROLLBACK;", "ROLLBACK")
+
+
+		# make sure the transaction above has been applied on db2
+		self.sleep(1)
+
+		# check the result
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT t FROM repl_test WHERE i = %d;" % self.TEST_ID)
+		self.assertEqual(res1, [{'t': 'insert from node 1'}],
+			"unexpected result on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT i, t FROM repl_test WHERE i = %d;" % self.TEST_ID)
+		self.assertEqual(res1, [{'t': 'insert from node 1'}],
+			"unexpected result on second connection")
+
+
+class TestUniqueViolation(SyncTest):
+
+	description = "insert conflict"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(5, self.conn1.operation, "ROLLBACK;")
+			self.syncCall(5, self.conn2.operation, "ROLLBACK;")
+
+	def sub_run(self):
+		# begin a transaction on both connections and try a conflicting
+		# update.
+		self.syncCall(2, self.conn1.operation,
+			"BEGIN;", "BEGIN")
+		self.syncCall(2, self.conn2.operation,
+			"BEGIN;", "BEGIN")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+
+		res = self.syncCall(5, self.conn1.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+		res = self.syncCall(5, self.conn2.operation,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		# two updates on different tuples, but updating leads to a conflict
+		# due to the uniqueness constraint on test_col of that table.
+		self.syncCall(2, self.conn1.operation,
+			"UPDATE test_unique_violation_table SET test_col = 3 WHERE id = 1;",
+			"UPDATE 1")
+		self.syncCall(2, self.conn2.operation,
+			"UPDATE test_unique_violation_table SET test_col = 3 WHERE id = 2;",
+			"UPDATE 1")
+
+		# commit the transaction on conn1 first
+		res = self.syncCall(5, self.conn1.operation, "COMMIT;")
+		self.assertEqual(res, "COMMIT",
+			"failed to commit first transaction")
+
+		# then try to commit the transaction on conn2, which should fail
+		res = self.syncCall(5, self.conn2.operation, "COMMIT;")
+		self.assertEqual("ERROR:  could not serialize transaction due to concurrent remote transaction", res,
+			"second transaction didn't get aborted, as expected")
+
+		self.syncCall(5, self.conn2.operation, "ROLLBACK;", "ROLLBACK")
+
+
+		# make sure the transaction above has been applied on db2
+		self.sleep(1)
+
+		# check the result
+		res1 = self.syncCall(5, self.conn1.query,
+			"SELECT id, test_col FROM test_unique_violation_table ORDER BY id;")
+		self.assertEqual(res1, [{'id': '1', 'test_col': '3'}, {'id': '2', 'test_col': '9'}],
+			"unexpected result on first connection")
+
+		res2 = self.syncCall(5, self.conn2.query,
+			"SELECT id, test_col FROM test_unique_violation_table ORDER BY id;")
+		self.assertEqual(res1, [{'id': '1', 'test_col': '3'}, {'id': '2', 'test_col': '9'}],
+			"unexpected result on second connection")
+
+
+class TestConcurrentUpdates(SyncTest):
+
+	description = "multiple concurrent updates"
+
+	args = (('testid', int), )
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'),
+			 ('conn3', 'ISqlConnection'),
+			 ('conn4', 'ISqlConnection'),
+			 ('conn5', 'ISqlConnection'))
+
+	def execOnAllConnections(self, timeout, sql, expRes=None):
+		deferreds = []
+		for conn in self.connections:
+			s = sql.replace("##id##", str(conn.db.getNumber()))
+			d = conn.operation(s, expRes)
+			d = Timeout("execOnAllConnections", timeout, d).getDeferred()
+			deferreds.append(d)
+
+		return defer.DeferredList(deferreds,
+								   consumeErrors=True, fireOnOneErrback=True)
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.execOnAllConnections(5, "ROLLBACK;")
+
+	def sub_run(self):
+		self.connections = [
+			self.conn1,
+			self.conn2,
+			self.conn3,
+			self.conn4,
+			self.conn5]
+
+		self.syncCall(10, self.connections[0].operation,
+			"INSERT INTO repl_test VALUES (%d, 'original tuple');" % self.testid,
+			"INSERT 0 1")
+
+		# must wait until that original tuple has been applied everywhere
+		self.sleep(1)
+
+		self.syncCall(5, self.execOnAllConnections, 2,
+			"BEGIN;", "BEGIN")
+
+		self.syncCall(5, self.execOnAllConnections, 2,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+
+		self.syncCall(5, self.execOnAllConnections, 2,
+			"SET TRANSACTION REPLICATION LEVEL EAGER;", "SET")
+
+		self.syncCall(5, self.execOnAllConnections, 2,
+			"UPDATE repl_test SET t = 'update from database system ##id##' WHERE i = %d;" % self.testid,
+			"UPDATE 1")
+
+		self.syncCall(7, self.execOnAllConnections, 5,
+			"COMMIT;", ["COMMIT",
+				    "ERROR:  could not serialize transaction due to concurrent remote transaction",
+				    "ERROR:  could not seriazile transaction due to concurrent update",
+				    "ERROR:  could not serialize access due to concurrent update"])
+
+		# wait for all nodes to have applied all transactions
+		self.sleep(2)
+
+		# check the result
+		try:
+			results = ['','','','','']
+			results[0] = self.syncCall(5, self.conn1.query,
+				"SELECT i, t FROM repl_test WHERE i = %d;" % self.testid)
+			results[1] = self.syncCall(5, self.conn2.query,
+				"SELECT i, t FROM repl_test WHERE i = %d;" % self.testid)
+			results[2] = self.syncCall(5, self.conn3.query,
+				"SELECT i, t FROM repl_test WHERE i = %d;" % self.testid)
+			results[3] = self.syncCall(5, self.conn4.query,
+				"SELECT i, t FROM repl_test WHERE i = %d;" % self.testid)
+			results[4] = self.syncCall(5, self.conn5.query,
+				"SELECT i, t FROM repl_test WHERE i = %d;" % self.testid)
+
+			for i in range(5):
+				if results[i][0]['t'].find("update from database system") < 0:
+					raise TestFailure("database %d didn't update the row" % (i+1,))
+
+			self.assertEqual(results[0], results[1], "results between 1 and 2 don't match")
+			self.assertEqual(results[1], results[2], "results between 2 and 3 don't match")
+			self.assertEqual(results[2], results[3], "results between 3 and 4 don't match")
+			self.assertEqual(results[3], results[4], "results between 4 and 5 don't match")
+
+		finally:
+			self.syncCall(7, self.execOnAllConnections, 5,
+				      "ROLLBACK;")
+
+class Logger(object):
+	def __init__(self, logFileName):
+		self.logfile = open(logFileName, 'w')
+
+	def __del__(self):
+		self.logfile.close()
+
+	def callback(self, event):
+		self.logfile.write(str(event) + "\n")
+		self.logfile.flush()
+
+
+class TestTrueSerializabilityConcurrentUpdates(SyncTest):
+	""" Runs three transactions concurrently, each reading from what the
+		other writes in turn. Should raise a serialization failure, but
+		instead leads to wrong results, ATM.
+	"""
+
+	description = "concurrent updates"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'),
+			 ('conn3', 'ISqlConnection'))
+
+	def execOnAllConnections(self, sql, expRes=None):
+		deferreds = []
+		for conn in self.connections:
+			d = conn.operation(sql, expRes)
+			deferreds.append(d)
+
+		d = defer.DeferredList(deferreds,
+							   consumeErrors=True, fireOnOneErrback=True)
+		return d
+
+	def readValueThenWrite(self, conn, readFromId, writeToId):
+		d = conn.query("SELECT t FROM test WHERE i = %d;" % readFromId)
+		d.addCallback(self.writeValueBack, conn, writeToId)
+		return d
+
+	def writeValueBack(self, result, conn, writeToId):
+		self.assertEqual(1, len(result),
+						 "expected exactly one result row")
+		row = result[0]
+		self.assertEqual(1, len(row),
+						 "expected exactly one column")
+		value = row['t']
+		d = conn.operation("UPDATE test SET t = '%s' WHERE i = %d;" % (value, writeToId),
+						   "UPDATE 1")
+		return d
+
+	def startConcurrentOperations(self):
+		d1 = self.readValueThenWrite(self.conn1, readFromId=5,  writeToId=7)
+		d2 = self.readValueThenWrite(self.conn2, readFromId=7,  writeToId=11)
+		d3 = self.readValueThenWrite(self.conn3, readFromId=11, writeToId=5)
+		return defer.DeferredList([d1, d2, d3],
+								  consumeErrors=True, fireOnOneErrback=True)
+
+	def run(self):
+		try:
+			self.sub_run()
+		finally:
+			self.syncCall(10, self.execOnAllConnections, "ROLLBACK;")
+
+	def sub_run(self):
+		self.connections = [
+			self.conn1,
+			self.conn2,
+			self.conn3]
+
+		# begin a transaction on all three connections
+		self.syncCall(10, self.execOnAllConnections,
+			"BEGIN;", "BEGIN")
+
+		# set their isolation level to SERIALIZABLE
+		self.syncCall(10, self.execOnAllConnections,
+			"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET")
+
+		# concurrently let each of the three transactions read a value and
+		# write that to another tuple, wait for all the UPDATEs to complete
+		# before trying to commit any of the transactions
+		self.syncCall(10, self.startConcurrentOperations)
+
+		# try to commit all three transactions (accepting both COMMIT or
+		# ERROR, we check the result later on).
+		self.syncCall(10, self.execOnAllConnections,
+			"COMMIT;", ("COMMIT", "ERROR"));
+
+		# count the occurrance of each fruit
+		result = self.syncCall(10, self.conn1.query,
+			"SELECT t FROM test WHERE i IN (5, 7, 11);")
+		counters = {'banana': 0, 'apple': 0, 'pear': 0}
+		for row in result:
+			counters[row['t']] += 1
+
+		# you currently get one fruit each, as no transaction gets aborted,
+		# which is impossible if the transactions had been executed one
+		# after another.
+		if counters.values() == [1, 1, 1]:
+			raise TestFailure("conflict not detected",
+				"All transactions committed, so the conflict hasn't been detected.")
+
+class TestTrueSerializabilityConcurrentInsert(BaseTest):
+	""" Runs two transactions, both doing an insert, first, then select
+		all the relevant rows (within the range 100 <= i < 110). We let the
+		first transaction commit before creating the cyclic dependency,
+		which forces transaction 2 to abort.
+	"""
+
+	description = "concurrent insert"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def execOnAllConnections(self, sql, expRes=None):
+		deferreds = []
+		for conn in self.connections:
+			d = conn.operation(sql, expRes)
+			deferreds.append(d)
+
+		d = defer.DeferredList(deferreds,
+							   consumeErrors=True, fireOnOneErrback=True)
+		return d
+
+	def run(self):
+		self.connections = [
+			self.conn1,
+			self.conn2]
+
+		# begin a transaction on all three connections
+		d = self.execOnAllConnections("BEGIN;", "BEGIN")
+
+		# set their isolation level to SERIALIZABLE
+		d.addCallback(lambda x:
+			self.execOnAllConnections(
+				"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET"))
+
+		# let transaction 1 do an insert (so it acquires a snapshot)
+		d.addCallback(lambda x:
+			self.conn1.operation(
+				"INSERT INTO test (i, t) VALUES (101, 'orange');", "INSERT 0 1"))
+
+		# then same for transaction 2
+		d.addCallback(lambda x:
+			self.conn2.operation(
+				"INSERT INTO test (i, t) VALUES (102, 'grapefruit');", "INSERT 0 1"))
+
+		# let transaction 1 read the relevant rows, so it acquires an SIREAD
+		# lock on the predicate. (The result is discarded).
+		d.addCallback(lambda x:
+			self.conn2.query("SELECT t FROM test WHERE i >= 100 AND i < 110;"))
+
+		# then commit transaction 1 (which should still succeed)
+		d.addCallback(lambda x:
+			self.conn1.operation(
+				"COMMIT;", "COMMIT"))
+
+		# try to read all rows with the second transaction's snapshot (which
+		# doesn't see the update of transaction 1)
+		d.addCallback(lambda x:
+			self.conn2.query("SELECT t FROM test WHERE i >= 100 AND i < 110;"))
+
+		# With SSI in place, this should lock the same predicate with an
+		# SIREAD lock, which should bomb out on the orange (tuple i = 101)
+		# from transaction 1.
+		#
+		# dtester FIXME: Hm.. this could need some "expect to fail" help
+		#                from dtester
+		d.addCallback(self.checkResult)
+
+		# cleanup both transactions, especially in case of failure
+		d.addBoth(self.cleanup)
+
+		return d
+
+	def checkResult(self, result):
+		if not isinstance(result, failure.Failure):
+			raise TestFailure("conflict not detected",
+				"SELECT should raise a serialization error")
+		return result
+
+	def cleanup(self, result):
+		d = self.execOnAllConnections("ROLLBACK;")
+
+		# ignore errors above, but instead make sure we return the result
+		# we got here, especially if it was an error.
+		d.addBoth(lambda x: result)
+		return d
+
+class TestTrueSerializabilityConcurrentInsert2(BaseTest):
+	""" Pretty similar to the above test, except that the first transaction
+		doesn't read (and thus predicate lock) the relevant rows. This still
+		leaves a possible serialization ordering, even if it doesn't match
+		the real commit ordering.
+
+		Uses rows 200 <= i < 210
+	"""
+
+	description = "concurrent insert"
+
+	needs = (('conn1', 'ISqlConnection'),
+			 ('conn2', 'ISqlConnection'))
+
+	def execOnAllConnections(self, sql, expRes=None):
+		deferreds = []
+		for conn in self.connections:
+			d = conn.operation(sql, expRes)
+			deferreds.append(d)
+
+		d = defer.DeferredList(deferreds,
+							   consumeErrors=True, fireOnOneErrback=True)
+		return d
+
+	def run(self):
+		self.connections = [
+			self.conn1,
+			self.conn2]
+
+		# begin a transaction on all three connections
+		d = self.execOnAllConnections("BEGIN;", "BEGIN")
+
+		# set their isolation level to SERIALIZABLE
+		d.addCallback(lambda x:
+			self.execOnAllConnections(
+				"SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", "SET"))
+
+		# let transaction 1 do an insert (so it acquires a snapshot)
+		d.addCallback(lambda x:
+			self.conn1.operation(
+				"INSERT INTO test (i, t) VALUES (201, 'orange');", "INSERT 0 1"))
+
+		# then same for transaction 2
+		d.addCallback(lambda x:
+			self.conn2.operation(
+				"INSERT INTO test (i, t) VALUES (202, 'grapefruit');", "INSERT 0 1"))
+
+		# no SELECT here, so transaction 1 doesn't acquire any SIREAD lock
+
+		# then commit transaction 1 (which should succeed)
+		d.addCallback(lambda x:
+			self.conn1.operation(
+				"COMMIT;", "COMMIT"))
+
+		# try to read all rows with the second transaction's snapshot (which
+		# doesn't see the update of transaction 1)
+		d.addCallback(lambda x:
+			self.conn2.query("SELECT t FROM test WHERE i >= 200 AND i < 210;"))
+
+		# With SSI in place, this should lock the same predicate as abover
+		# with an SIREAD lock. This includes the row just written by the
+		# first transaction.
+		#
+		# As long as there are no other edges, this still leaves a possible
+		# serialization ordering: if we executed the second transaction
+		# *before* the first one, the second didn't see the 'orange' row
+		# inserted "later" by the first transaction. That's the result we
+		# expect.
+		d.addCallback(self.checkResult)
+
+		# commit transaction 2
+		d.addCallback(lambda x:
+			self.conn2.operation(
+				"COMMIT;", "COMMIT"))
+
+		# add a cleanup handler
+		d.addErrback(self.cleanup)
+
+		return d
+
+	def checkResult(self, result):
+		self.assertEqual(len(result), 1,
+			"Expected exactly one row, got %d (%s)" % (
+				len(result), repr(result)))
+		self.assertEqual(result[0], {"t": "grapefruit"},
+			"Expected to read the grapefruit row, but got %s" % (result[0],))
+
+		return result
+
+	def cleanup(self, result):
+		d = self.execOnAllConnections("ROLLBACK;")
+
+		# ignore errors above, but instead make sure we return the result
+		# we got here, especially if it was an error.
+		d.addBoth(lambda x: result)
+		return d
+
+
+# ******  test running code  ************************************************
+
+class Logger(object):
+	""" A simplistic logger that just writes it all into one single file.
+	"""
+	def __init__(self, logFileName):
+		self.logfile = open(logFileName, 'w')
+
+	def __del__(self):
+		self.logfile.close()
+
+	def callback(self, event):
+		self.logfile.write(str(event) + "\n")
+		self.logfile.flush()
+
+def main(argv):
+	print "Postgres dtester suite\n"
+
+	postgres_configure_args = "@configure_args@"
+
+	config = {
+			'temp-port': 65432,
+
+			# by default, use the same installation directory as make check
+			'inst_dir': os.path.join(os.getcwd(), 'tmp_check/install'),
+
+			# and a similar prefix
+			'pgdata_prefix': os.path.join(os.getcwd(), 'tmp_check/data-dtester'),
+			'logfile' : os.path.join(os.getcwd(), 'dtester.log'),
+
+			'enable_cassert': 'enable_cassert' in postgres_configure_args
+	}
+
+	try:
+		opts, args = getopt.getopt(argv,
+			"h",
+			["help", "temp-install", "top-builddir=", "temp-port=",
+			 "multibyte="])
+	except getopt.GetoptError:
+		usage()
+		sys.exit(2)
+
+	for opt, arg in opts:
+		if opt in ("-h", "--help"):
+			usage()
+			sys.exit()
+		elif opt in ("--temp-install"):
+			config["temp-install"] = True
+		elif opt in ("--temp-port"):
+			try:
+				arg = int(arg)
+				if arg >= 1024 and arg <= 65535:
+					config["temp-port"] = arg
+				else:
+					print "temp-port out of range."
+					sys.exit(2)
+			except ValueError:
+				print "Fatal: invalid temp-port specified"
+				sys.exit(2)
+		elif opt in ("--top-builddir"):
+			config["top-builddir"] = arg
+
+
+	if not config.has_key('bindir'):
+		bindir = '@bindir@'
+		if bindir[0] == '/':
+			bindir = bindir[1:]
+		config['bindir'] = os.path.join(config['inst_dir'], bindir)
+	if not config.has_key('libdir'):
+		libdir = '@libdir@'
+		if libdir[0] == '/':
+			libdir = libdir[1:]
+		config['libdir'] = os.path.join(config['inst_dir'], libdir)
+	if not config.has_key('datadir'):
+		datadir = '@datadir@'
+		if datadir[0] == '/':
+			datadir = datadir[1:]
+		config['datadir'] = os.path.join(config['inst_dir'], datadir)
+
+
+	# FIXME: should not have to be here
+	logger = Logger(config['logfile'])
+	config['main_logging_hook'] = (EventMatcher(Event), logger.callback)
+
+
+	# definition of tests and suites, including their dependencies
+	tdef = {
+		# runs 'make install' to make sure the installation is up to date
+		'temp_install':		{'class': InstallationSuite,
+							 'uses': ('__system__',)},
+
+		# runs initdb, providing the Postgres data directory
+		'initdb-0':			{'class': InitdbSuite,
+							 'uses': ('temp_install',),
+							 'args': (0,)},
+
+		# disables pretty_print
+		'main-config-appender': {
+						 'class': PostgresConfigAppender,
+						 'uses': ('initdb-0',),
+						 'args': ("""
+debug_pretty_print = off
+""",),
+						 'depends': ['initdb-0']},
+
+		# runs a postmaster on the created database directory
+		'init-pg':			{'class': PostmasterSuite,
+							 'uses': ('temp_install', 'initdb-0'),
+							 'onlyAfter': ['main-config-appender']},
+
+		# creates a test database on pg-0
+		'testdb':			{'class': TestDatabaseSuite,
+							 'uses': ('temp_install', 'init-pg'),
+							 'args': ('testdb',)},
+
+		# open two connections
+		'conn-0A':			{'class': SqlConnectionSuite,
+							 'uses': ('temp_install', 'init-pg'),
+							 'args': ('testdb',),
+							 'depends': ('testdb',)},
+		'conn-0B':			{'class': SqlConnectionSuite,
+							 'uses': ('temp_install', 'init-pg'),
+							 'args': ('testdb',),
+							 'depends': ('testdb',)},
+		'conn-0C':			{'class': SqlConnectionSuite,
+							 'uses': ('temp_install', 'init-pg'),
+							 'args': ('testdb',),
+							 'depends': ('testdb',)},
+
+		# test the connections
+		'test-conn-0A':		{'class': TestDatabaseConnection,
+							 'uses': ('conn-0A',)},
+		'test-conn-0B':		{'class': TestDatabaseConnection,
+							 'uses': ('conn-0B',)},
+		'test-conn-0C':		{'class': TestDatabaseConnection,
+							 'uses': ('conn-0C',)},
+
+		# populate the test database
+		'populate-testdb':	{'class': PopulateTestDatabase,
+							 'uses': ('conn-0A',),
+							 'onlyAfter': ('test-conn-0A', 'test-conn-0B',
+										   'test-conn-0C')},
+
+		'ser-updates':		{'class': TestTrueSerializabilityConcurrentUpdates,
+							 'uses': ('conn-0A', 'conn-0B', 'conn-0C'),
+							 'onlyAfter': ('populate-testdb',),
+							 'xfail': True},
+
+		'ser-insert':		{'class': TestTrueSerializabilityConcurrentInsert,
+							 'uses': ('conn-0A', 'conn-0B'),
+							 'onlyAfter': ('ser-updates',),
+							 'xfail': True},
+
+		'ser-insert2':		{'class': TestTrueSerializabilityConcurrentInsert2,
+							 'uses': ('conn-0A', 'conn-0B'),
+							 'onlyAfter': ('ser-insert',)},
+
+		'egcs':				{'class': EgcsSuite,
+							 'onlyAfter': ('init-pg',),
+							 'args': (logger,)}
+	}
+
+	NUM = 5
+	for i in range(NUM):
+		# let all other nodes just copy and continue from there
+		if i > 0:
+			tdef['copydb-%d' % i] = {
+				'class': InitdbCopySuite,
+				'uses': ('initdb-0', 'temp_install'),
+				'args': (i,),
+				'onlyAfter': ('init-pg',)
+			}
+			dbdir = 'copydb-%d' % i
+		else:
+			dbdir = 'initdb-0'
+
+		tdef['dir-%d' % i] = {'class': TestDatabaseDirectory,
+							  'uses': (dbdir,)}
+
+		tdef['config-appender-%d' % i] = {
+							 'class': PostgresConfigAppender,
+							 'uses': (dbdir,),
+							 'args': ("""
+replication = on
+replication_gcs = egcs
+""",),
+							 # make sure all copying is done before
+							 # modifying any of them. This also ensures
+							 # the later postmaster processes start only
+							 # after that.
+							 'depends': ['copydb-%d' % (j+1) for j in range(NUM-1)]}
+
+		if i == 0:
+			tdef['config-appender-%d' % i] = {
+							 'class': PostgresConfigAppender,
+							 'uses': (dbdir,),
+							 'args': ("""
+replication = on
+replication_gcs = egcs
+replication_seed = on
+""",),
+							# make sure all copying is done before
+							# modifying any of them. This also ensures
+							# the later postmaster processes start only
+							# after that.
+							'depends': ["copydb-%d" % (j+1) for j in range(NUM-1)]}
+
+		tdef['pg-%d' % i] = {'class': PostmasterSuite,
+							 'uses': ('temp_install', dbdir),
+							 'depends': ('config-appender-%d' % i, 'egcs')}
+
+		tdef['conn-%d' % i] = {
+							 'class': SqlConnectionSuite,
+							 'uses': ('temp_install', 'pg-%d' % i),
+							 'args': ('testdb',),
+							 'onlyAfter': ('sleep',),
+							 # 'depends': ('testdb',)
+							}
+
+		tdef['test-dbconn-%d' % i] = {
+							 'class': TestDatabaseConnection,
+							 'uses': ('conn-%d' % i,)}
+
+
+	tdef['sleep'] = {
+		'class': Sleep,
+		'depends': ('pg-%d' % i for i in range(NUM)),
+		'args': (12,)}
+
+	tdef['test-row-update'] = {
+		'class': TestSimpleRowUpdateReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('sleep',)}
+
+	tdef['test-row-insert'] = {
+		'class': TestSimpleRowInsertReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-row-update',)}
+
+	tdef['test-row-delete'] = {
+		'class': TestSimpleRowDeleteReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-row-insert',)}
+
+	tdef['test-sequence-increment'] = {
+		'class': TestSimpleSequenceIncrement,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-row-delete',)}
+
+	tdef['test-sequence-assignment'] = {
+		'class': TestSimpleSequenceAssignment,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-sequence-increment',)}
+
+	tdef['test-array-update'] = {
+		'class': TestArrayRowUpdateReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-sequence-assignment',)}
+
+	tdef['test-stored-procedure'] = {
+		'class': TestStoredProcedureChangeReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-array-update',)}
+
+	tdef['test-before-row-trigger'] = {
+		'class': TestBeforeRowTrigger,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-stored-procedure',)}
+
+	tdef['test-after-row-trigger'] = {
+		'class': TestAfterRowTrigger,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-before-row-trigger',)}
+
+	tdef['test-subtransactions'] = {
+		'class': TestSubtransactions,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-after-row-trigger',)}
+
+	tdef['test-large-cset-1'] = {
+		'class': TestLargeCsetReplication,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-subtransactions',)}
+
+	tdef['test-large-cset-2'] = {
+		'class': TestLargeCsetReplication2,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-large-cset-1',)}
+
+	tdef['test-large-cset-3'] = {
+		'class': TestLargeCsetReplication3,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-large-cset-2',)}
+
+	tdef['test-update-conflict'] = {
+		'class': TestUpdateConflict,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-large-cset-3',)}
+
+	tdef['test-insert-conflict'] = {
+		'class': TestInsertConflict,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-update-conflict',)}
+
+	tdef['test-unique-violation'] = {
+		'class': TestUniqueViolation,
+		'uses': ('conn-0', 'conn-1'),
+		'onlyAfter': ('test-insert-conflict',)}
+
+	tdef['test-concurrent-updates1'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-unique-violation',),
+		'args': (27,)}
+
+	tdef['test-concurrent-updates2'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates1',),
+		'args': (28,)}
+
+	tdef['test-concurrent-updates3'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates2',),
+		'args': (29,)}
+
+	tdef['test-concurrent-updates4'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates3',),
+		'args': (7004,)}
+
+
+	tdef['test-concurrent-updates5'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates4',),
+		'args': (7005,)}
+
+
+	tdef['test-concurrent-updates6'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates5',),
+		'args': (7006,)}
+
+	tdef['test-concurrent-updates7'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates6',),
+		'args': (7007,)}
+
+	tdef['test-concurrent-updates8'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates7',),
+		'args': (7008,)}
+
+	tdef['test-concurrent-updates9'] = {
+		'class': TestConcurrentUpdates,
+		'uses': ('conn-0', 'conn-1', 'conn-2', 'conn-3', 'conn-4'),
+		'onlyAfter': ('test-concurrent-updates8',),
+		'args': (7009,)}
+
+	runner = Runner(testTimeout=testTimeout, suiteTimeout=suiteTimeout)
+	runner.run(tdef, config)
+
+
+if __name__ == "__main__":
+	main(sys.argv[1:])
+
