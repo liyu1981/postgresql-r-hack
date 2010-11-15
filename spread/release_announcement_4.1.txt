@@ -1,0 +1,45 @@
+Spread 4.1.0  http://www.spread.org
+
+Spread Concepts LLC and Johns Hopkins University's Distributed Systems 
+and Networks Lab are happy to announce the release of a 
+new stable version, 4.1.0, of the Spread toolkit. 
+
+The Spread 4.1 release is mainly a bugfix release with a few minor
+features. This release includes some requested new features such as:
+
+1) Make location of unix domain socket configurable at compile time.
+2) Add version numbers to the Spread library. 
+3) Add runtime configuration option in spread.conf for the maximum number
+of messages Spread should buffer for each client before disconnecting them.
+4) Add high-precision timestamps to log file events. To activate enable
+EventPreciseTimeStamp flag in spread.conf.
+
+It also includes the usual collection of bug fixes. Details of the new 
+capabilities can be found in the Readme.txt file included in the distribution.
+
+This release does not have any visible API changes, so not applications
+should require code changes to support this release. Applications
+linked with the 4.0 libspread libraries should continue to work. However,
+we recommend relinking against the new library as it fixes some known bugs.
+
+We believe this release is stable and provides a solid platform for
+Spread applications.
+
+Spread is a toolkit that provides a high performance messaging service
+that is resilient to faults across external or internal
+networks. Spread functions as a unified message bus for distributed
+applications, and provides highly tuned application-level multicast
+and group communication support. Spread services range from reliable
+message passing to fully ordered messages with delivery guarantees,
+even in case of computer failures and network partitions.
+
+Please be aware, that under the Spread Open Source License, the toolkit may 
+be freely used only under some conditions. For example, the license includes 
+the requirement that all advertising materials (including web pages) 
+mentioning software that uses Spread display a specific acknowledgment. 
+Please review the license agreement for more details.
+http://www.spread.org/license/
+
+Other commercial licenses or other licensing arrangements are available. 
+Please contact info@spreadconcepts.com. 
+
