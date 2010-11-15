@@ -16,7 +16,7 @@ OBJS = walsender.o walreceiverfuncs.o walreceiver.o
 
 ifeq ($(enable_replication), yes)
 OBJS += gc_utils.o gc_egcs.o \
-       cset.o local.o remote.o coordinator.o utils.o recovery.o
+       cset.o local.o remote.o coordinator.o utils.o recovery.o gc_ensemble.o gc_spread.o
 # defunct: gc_ensemble.o gc_spread.o
 endif
 

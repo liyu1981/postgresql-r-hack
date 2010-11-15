@@ -1018,14 +1018,14 @@ coordinator_replication_init(void)
 
 	if (replication_enabled)
 	{
-#if 0
+//#if 0
 		if ((pg_strncasecmp(replication_gcs, "ensemble", 8) == 0) &&
 				(replication_gcs[8] == ':' || replication_gcs[8] == '\0'))
 			ens_init(gcsi, gc_parse_params(&replication_gcs[8]));
 		else if (pg_strncasecmp(replication_gcs, "spread", 6) == 0)
 			spread_init(gcsi);
-#endif
-		if (pg_strncasecmp(replication_gcs, "egcs", 4) == 0 &&
+//#endif
+		else if (pg_strncasecmp(replication_gcs, "egcs", 4) == 0 &&
 				(replication_gcs[4] == ':' || replication_gcs[4] == '\0'))
 			egcs_init(gcsi, gc_parse_params(&replication_gcs[4]));
 		else

@@ -138,7 +138,7 @@ rdb_state			db_state = RDBS_UNKNOWN;
 /* guc variables for replication */
 bool				replication_enabled = false;
 bool				replication_may_seed = false;
-char			   *replication_gcs = "ensemble";
+char			   *replication_gcs = "spread";
 char			   *replication_group_name = "postgres";
 
 #endif	/* REPLICATION */
