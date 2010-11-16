@@ -198,7 +198,7 @@ PTHREAD_LIBS		= @PTHREAD_LIBS@
 # Compilers
 
 CPP = @CPP@
-CPPFLAGS = @CPPFLAGS@
+CPPFLAGS = @CPPFLAGS@ -I$(top_srcdir)/../spread/include
 
 ifdef PGXS
 override CPPFLAGS := -I$(includedir_server) -I$(includedir_internal) $(CPPFLAGS)
@@ -467,7 +467,7 @@ endif
 
 LIBOBJS = @LIBOBJS@
 
-LIBS := -lpgport $(LIBS)
+LIBS := -lpgport $(LIBS) -L$(top_srcdir)/../spread/libspread
 
 # to make ws2_32.lib the last library, and always link with shfolder,
 # so SHGetFolderName isn't picked up from shell32.dll

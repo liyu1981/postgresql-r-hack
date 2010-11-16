@@ -1,6 +1,13 @@
 *.o
+*.out
 *.so
-*.so.*
+*.so.[0-9]
+*.so.[0-9].[0-9]
+*.sl
+*.sl.[0-9]
+*.sl.[0-9].[0-9]
+*.dylib
+*.dll
 *.log
 *.cache
 *.port
@@ -71,8 +78,6 @@ src/port/libpgport_srv.a
 src/port/pg_config_paths.h
 src/timezone/objfiles.txt
 src/timezone/zic
-spread/daemon/config.h
-spread/stdutil/src/stdutil/private/stdarch_autoconf.h
 src/backend/postgres
 src/backend/replication/objfiles.txt
 src/backend/rewrite/objfiles.txt

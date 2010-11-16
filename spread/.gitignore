@@ -1,0 +1,14 @@
+# This file will track the files to be ignored in spread
+*.o
+*.[tld]o
+*.[tld][tld]o
+*.[tld][tld][tld]o
+examples/*
+# single files go below
+daemon/config.h
+daemon/spmonitor
+daemon/spread
+stdutil/src/stdutil/private/stdarch_autoconf.h
+#	daemon/config.h
+#	daemon/spmonitor
+#	daemon/spread
