@@ -1022,8 +1022,9 @@ coordinator_replication_init(void)
 		if ((pg_strncasecmp(replication_gcs, "ensemble", 8) == 0) &&
 				(replication_gcs[8] == ':' || replication_gcs[8] == '\0'))
 			ens_init(gcsi, gc_parse_params(&replication_gcs[8]));
-		else if (pg_strncasecmp(replication_gcs, "spread", 6) == 0)
-			spread_init(gcsi);
+		else if (pg_strncasecmp(replication_gcs, "spread", 6) == 0 &&
+		         (replication_gcs[6] == ':' || replication_gcs[6] == '\0'))
+			spread_init(gcsi, gc_parse_params(&replication_gcs[6]));
 //#endif
 		else if (pg_strncasecmp(replication_gcs, "egcs", 4) == 0 &&
 				(replication_gcs[4] == ':' || replication_gcs[4] == '\0'))
