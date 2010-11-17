@@ -28,6 +28,8 @@
 
 
 #define GC_DATA(gcsi) ((spread_data*)((gcsi)->data))
+#define GC_NODE(node) ((spread_node*)((node)->gcs_node))
+
 #define RECV_BUFFER_SIZE 2048
 
 #define SPREAD_VERSION 4
@@ -39,7 +41,6 @@
 #define MAX_GROUP_NAME_SIZE 32
 
 #define ACCEPT_SESSION 1
-
 
 typedef enum
 {
@@ -56,16 +57,18 @@ typedef enum
 
 typedef struct
 {
-	int socket;
+	char spread_name[MAX_PRIVATE_NAME];
+	mailbox mbox;
+	char private_group_name[MAX_GROUP_NAME_SIZE];
+
 	buffer recv_buffer;
 	spread_state state;
-	char private_group_name[MAX_GROUP_NAME_SIZE];
 } spread_data;
 
 typedef struct
 {
-	/* the node identifier */
-	char		spreadid[128];
+	/* private_group_name got by connect to spread daemon, as id to each connectioin */
+	char unicast_group_name[MAX_GROUP_NAME_SIZE];
 
 	/* the coordinator node_id */
 	uint32		node_id;
@@ -111,22 +114,29 @@ void spread_unicast(const gcs_group *group, const group_node *node,
 void
 spread_recv(gcs_info *gcsi)
 {
-	int err;
+	int     err;
 	buffer *b = &GC_DATA(gcsi)->recv_buffer;
 
-	err = recv(GC_DATA(gcsi)->socket,
-			  (void*)((Pointer) b->data + b->fill_size),
-			  b->max_size - b->ptr, 0);
-
-	b->fill_size += err;
-
-	if (err == 0)
-		elog(ERROR, "GC Layer: GCS terminated connection.");
+	err = SP_poll(GC_DATA(gcsi)->mbox);
+	if(err > 0)
+	{
+		
+	}
+	else
+	{
+		/* no message waiting or error occured, just return */
+		return;
+	}
 }
 
 void
 spread_init(gcs_info *gcsi, char **params)
 {
+	gcsi->data = palloc(sizeof(spread_data));
+	init_buffer(&GC_DATA(gcsi)->recv_buffer, palloc(RECV_BUFFER_SIZE),
+	            RECV_BUFFER_SIZE);
+	gc_init_groups_hash(gcsi);
+
 	/* set all the methods for the coordinator to interact with the GCS */
 	gcsi->funcs.connect = &spread_connect;
 	gcsi->funcs.disconnect = &spread_disconnect;
@@ -138,99 +148,61 @@ spread_init(gcs_info *gcsi, char **params)
 	gcsi->funcs.is_local = &spread_is_local;
 	gcsi->funcs.broadcast = &spread_broadcast;
 	gcsi->funcs.unicast = &spread_unicast;
+
+	GC_DATA(gcsi)->spread_name = "4803";
 }
 
 void
 spread_connect(gcs_info *gcsi)
 {
-#ifdef THIS_CODE_IS_NOT_CURRENTLY_FUNCTIONAL
-	buffer	b;
 	int		err;
-    struct sockaddr_in sin;
-	char   *connectmsg;
 
 	Assert(gcsi);
 	Assert(gcsi->conn_state == GCSCS_DOWN);
 
 	elog(DEBUG3, "GC Layer: connecting to the spread daemon");
 
-	if (gcsi->socket_path && (strcmp(gcsi->socket_path, "") != 0))
-		elog(WARNING, "GC Layer: the spread interface does not suppport "
-			 "unix sockets. Using the portnumber.");
-
-	/* initialize the group communication data object */
-	gcsi->data = palloc(sizeof(spread_data));
-
 	/* set correct state */
 	GC_DATA(gcsi)->state = SPS_INITIALIZING;
 
-	/* initialize the recieve buffer */
-	init_buffer(&GC_DATA(gcsi)->recv_buffer, palloc(RECV_BUFFER_SIZE),
-					RECV_BUFFER_SIZE, &spread_alloc, NULL, (void*) gcsi);
+	err = SP_connect(GC_DATA(gcsi)->spread_name,         /* spread_name: local daemon @ 4803 will be connected */ 
+	                 NULL,                               /* private_name: let spread gives one, so use NULL */
+	                 0,                                  /* priority: this has no effect according to spread document */
+	                 1,                                  /* group_membership: 1 - yes, we want membership messages */
+	                 &GC_DATA(gcsi)->mbox,               /* mbox: */
+	                 GC_DATA(gcsi)->private_group_name);
 
-	gc_init_groups_hash(gcsi);
-
-	/* connect to the spread daemon */
-	GC_DATA(gcsi)->socket = socket(AF_INET, SOCK_STREAM, 0);
-	if (!GC_DATA(gcsi)->socket)
+	switch(err) 
 	{
-		elog(DEBUG3, "GC Layer: error creating a socket");
-		gcsi_gcs_failed(gcsi);
-		return;
-	}
-
-	/* connect */
-    sin.sin_family = AF_INET;
-    inet_aton("127.0.0.1", &(sin.sin_addr));
-    sin.sin_port = ntohs(gcsi->port);
-
-	err = connect(GC_DATA(gcsi)->socket,
-				  (struct sockaddr*) &sin, sizeof(sin));
-	if (err < 0)
-	{
-		elog(DEBUG1, "GC Layer: error connecting to the group "
-			 "communication system!");
-		gcsi_gcs_failed(gcsi);
-		return;
-	}
-
-	/* send join message */
-	connectmsg = palloc(10);
-	init_buffer(&b, connectmsg, 10, &spread_alloc, NULL, NULL);
-
-	put_int8(&b, SPREAD_VERSION);
-	put_int8(&b, SPREAD_SUBVERSION);
-	put_int8(&b, SPREAD_PATCHLEVEL);
-	/* with groups, priority = 0 -- (priority << 4) || with_groups) */
-	put_int8(&b, 1);
-	put_pstring(&b, "");  /* the private name */
-
-	/* send the connect message */
-	err = send(GC_DATA(gcsi)->socket, connectmsg, b.fill_size, MSG_NOSIGNAL);
-	if (err != b.fill_size)
-	{
-		elog(DEBUG1, "GC Layer: error sending join message to server (%s)!",
-					 strerror(errno));
-		gcsi_gcs_failed(gcsi);
-		return;
+	    case ACCEPT_SESSION:
+		    elog(DEBUG3, "GC Layer: accept seesion.");
+		    break;
+	    case ILLEGAL_SPREAD:
+		    elog(ERROR, "GC Layer: connect error - illegal spread.");
+	    case COULD_NOT_CONNECT:
+		    elog(ERROR, "GC Layer: connect error - could not connect.");
+	    case CONNECTION_CLOSED:
+		    elog(ERROR, "GC Layer: connect error - connection closed.");
+	    case REJECT_VERSION:
+		    elog(ERROR, "GC Layer: connect error - reject version.");
+	    case REJECT_NO_NAME:
+		    elog(ERROR, "GC Layer: connect error - reject no name.");
+	    case REJECT_ILLEGAL_NAME:
+		    elog(ERROR, "GC Layer: connect error - reject illegal name.");
+	    case REJECT_NOT_UNIQUE:
+		    elog(ERROR, "GC Layer: connect error - reject not unique.");
+	    default:
+		    gcsi_gcs_failed(gcsi);
+		    return;
 	}
 
 	gcsi->conn_state == GCSCS_REQUESTED;
-
-	pfree(connectmsg);
-#else
-	/* non-functional */
-	gcsi_gcs_failed(gcsi);
-	return;
-#endif
 }
 
 void
 spread_disconnect(gcs_info *gcsi)
 {
-	/* FIXME: we should really send a KILL_MESS here */
-
-	close(GC_DATA(gcsi)->socket);
+	SP_disconnect(GC_DATA(gcsi)->mbox);
 	pfree(gcsi->data);
 }
 
@@ -270,21 +242,64 @@ spread_multicast(const gcs_info *gcsi,
 gcs_group *
 spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 {
-	/* FIXME: handle parent groups */
+	int        err;
 	gcs_group *new_group;
+	gcs_group *pgroup;
+	int		   i, j, full_group_name_len;
+	char	  *full_group_name;
 
-	/*
-	 * FIXME: better error checking, as this is a user supplied argument.
-	 * allowed characters are between 0x24 and 0x7E for spread
-	 */
-	Assert(NAMEDATALEN > MAX_GROUP_NAME_SIZE);
-	Assert(strlen(group_name) < MAX_GROUP_NAME_SIZE);
-	Assert(strlen(group_name) > 0);
+	Assert(gcsi->conn_state == GCSCS_ESTABLISHED);
 
-	new_group = gc_create_group(gcsi, group_name, 128,
+	full_group_name_len = strlen(group_name);
+
+	pgroup = parent_group;
+	while (pgroup)
+	{
+		full_group_name_len += 1 + strlen(pgroup->name);
+		pgroup = pgroup->parent;
+	}
+
+	full_group_name = palloc(full_group_name_len + 1);
+	i = full_group_name_len;
+
+	/* group name itself as last element */
+	i -= strlen(group_name);
+	strcpy(&full_group_name[i], group_name);
+	i--;
+
+	/* then walk up parent names */
+	pgroup = parent_group;
+	while (pgroup)
+	{
+		j = i - strlen(pgroup->name);
+		strcpy(&full_group_name[j], pgroup->name);
+		full_group_name[i] = '.';
+		pgroup = pgroup->parent;
+		i = j - 1;
+	}
+
+	elog(DEBUG3, "GC Layer: joining group '%s'", full_group_name);
+
+	err = SP_join(GC_DATA(gcsi)->mbox, full_group_name);
+
+	switch(err)
+	{
+	    case 0:
+		    break;
+	    case ILLEGAL_GROUP:
+		    elog(ERROR, "GC Layer: error in joining group: illegal group.");
+	    case ILLEGAL_SESSION:
+		    elog(ERROR, "GC Layer: error in joining group: illegal session.");
+	    case CONNECTION_CLOSED:
+		    elog(ERROR, "GC Layer: error in joining group: connection closed.");
+	    default:
+		    /* FIXME: */
+		    break;
+	}
+
+	new_group = gc_create_group(gcsi, full_group_name, sizeof(int),
 								sizeof(spread_node));
-
-	spread_multicast(gcsi, SPST_JOIN, new_group, NULL, 0);
+	new_group->parent = parent_group;
 
 	return new_group;
 }
@@ -296,7 +311,7 @@ spread_leave(gcs_group *group)
 	Assert(group->gcsi);
 	Assert(group->gcsi->conn_state == GCSCS_ESTABLISHED);
 
-	spread_multicast(group->gcsi, SPST_LEAVE, group, NULL, 0);
+	SP_leave(GC_DATA(gcsi)->mbox, group->name);
 	gc_destroy_group(group);
 }
 
@@ -304,20 +319,82 @@ void
 spread_broadcast(const gcs_group *group, const void *data, int size,
 				 bool atomic)
 {
+	int     err;
+	service st;
+
+	Assert(group->gcsi->conn_state == GCSCS_ESTABLISHED);
+
+	if(atomic)
+		st = RELIABLE_MESS;
+	else
+		st = UNRELIABLE_MESS;
+
+	err = SP_multicast(GC_DATA(gcsi)->mbox,
+	                   st,
+	                   group->name,
+	                   0, /* mess_type: short int, indicate what the message is, not used now */
+	                   size,
+	                   (const char*)data);
+
+	switch(err)
+	{
+	    case ILLEGAL_SESSION:
+		    elog(ERROR, "GC Layer: error in broadcast - illegal session.");
+	    case ILLEGAL_MESSAGE:
+		    elog(ERROR, "GC Layer: error in broadcast - illegal message.");
+	    case CONNECTION_CLOSED:
+		    elog(ERROR, "GC Layer: error in broadcast - connection closed.");
+		    /* FIXME: so what? */
+		    break;
+	    default:
+		    if(err >= 0)
+			    elog(DEBUG4, "GC Layer: %d bytes broadcast.", err);
+		    else
+		    {
+			    elog(ERROR, "GC Layer: unknown error %d in broadcast.", err);
+			    /* FIXME: so what? */
+		    }
+	}
 }
 
 void
 spread_unicast(const gcs_group *group, const group_node *node,
 			   const void *data, int size)
 {
+	int     err;
+	service st;
+
+	err = SP_multicast(GC_DATA(gcsi)->mbox,
+	                   RELIABLE_MESS,
+	                   GC_NODE(node)->unicast_group_name,
+	                   0,
+	                   size,
+	                   (const char*)data);
+	switch(err)
+	{
+	    case ILLEGAL_SESSION:
+		    elog(ERROR, "GC Layer: error in broadcast - illegal session.");
+	    case ILLEGAL_MESSAGE:
+		    elog(ERROR, "GC Layer: error in broadcast - illegal message.");
+	    case CONNECTION_CLOSED:
+		    elog(ERROR, "GC Layer: error in broadcast - connection closed.");
+		    /* FIXME: so what? */
+		    break;
+	    default:
+		    if(err >= 0)
+			    elog(DEBUG4, "GC Layer: %d bytes broadcast.", err);
+		    else
+		    {
+			    elog(ERROR, "GC Layer: unknown error %d in broadcast.", err);
+			    /* FIXME: so what? */
+		    }
+	}
 }
 
 void
 spread_set_socks(const gcs_info *gcsi, fd_set *socks, int *max_socks)
 {
-	FD_SET(GC_DATA(gcsi)->socket, socks);
-	if (GC_DATA(gcsi)->socket > *max_socks)
-		*max_socks = GC_DATA(gcsi)->socket;
+	/* spread does not use socks for communication, so nothing to do */
 }
 
 void
