@@ -26,21 +26,13 @@
 #include "replication/replication.h"
 #include "replication/gc.h"
 
+#include <sp.h> /* spread header */
 
 #define GC_DATA(gcsi) ((spread_data*)((gcsi)->data))
 #define GC_NODE(node) ((spread_node*)((node)->gcs_node))
 
 #define RECV_BUFFER_SIZE 2048
-
-#define SPREAD_VERSION 4
-#define SPREAD_SUBVERSION 0
-#define SPREAD_PATCHLEVEL 0
-
-#define MAX_AUTH_NAME 30
-#define MAX_AUTH_METHODS 3
-#define MAX_GROUP_NAME_SIZE 32
-
-#define ACCEPT_SESSION 1
+#define MAX_MEMBERS      100
 
 typedef enum
 {
@@ -49,57 +41,46 @@ typedef enum
 	SPS_READY = 12
 } spread_state;
 
-typedef enum
-{
-	SPST_JOIN = 0x00010000,
-	SPST_LEAVE = 0x00020000,
-} spread_service_type;
-
 typedef struct
 {
-	char spread_name[MAX_PRIVATE_NAME];
+	char    spread_name[MAX_GROUP_NAME];
 	mailbox mbox;
-	char private_group_name[MAX_GROUP_NAME_SIZE];
+	char    group_name[MAX_GROUP_NAME];
+	char    private_group_name[MAX_GROUP_NAME];
 
-	buffer recv_buffer;
 	spread_state state;
+
+	/* receive related stuff */
+	buffer recv_buffer;
+	char   sender[MAX_GROUP_NAME];
+	char   target_groups[MAX_MEMBERS][MAX_GROUP_NAME];
+	char   members[MAX_MEMBERS][MAX_GROUP_NAME];
+	int    num_groups;
+	int    service_type;
+	int16  mess_type;
+	int    endian_mismatch;
 } spread_data;
 
 typedef struct
 {
-	/* private_group_name got by connect to spread daemon, as id to each connectioin */
-	char unicast_group_name[MAX_GROUP_NAME_SIZE];
+	char private_group_name[MAX_GROUP_NAME];
+
+	/* each node_id, calculated based on private_group_name */
+	uint32      id;
 
 	/* the coordinator node_id */
 	uint32		node_id;
 } spread_node;
 
-/* endian stuff, copy'n'pasted, correct that */
-#ifdef WORDS_BIGENDIAN
-#define ARCH_ENDIAN 0x00000000
-#else
-#define ARCH_ENDIAN 0x80000080
-#endif
-
-#define ENDIAN_TYPE 0x80000080
-
-#define Get_endian(type) ((type) & ENDIAN_TYPE)
-#define Set_endian(type) (((type) & ~ENDIAN_TYPE) | ARCH_ENDIAN)
-#define Same_endian(type) (((type) & ENDIAN_TYPE) == ARCH_ENDIAN)
-#define Clear_endian(type) ((type) & ~ENDIAN_TYPE)
 
 /* prototypes */
-void spread_recv(gcs_info *gcsi);
-void spread_multicast(const gcs_info *gcsi,
-					  const spread_service_type service_type,
-					  const gcs_group *group, const void *data,
-					  const int size);
+uint32 pgn2id(const char *name);
 
+void spread_recv(gcs_info *gcsi);
 void spread_connect(gcs_info *gcsi);
 void spread_disconnect(gcs_info *gcsi);
 void spread_set_socks(const gcs_info *gcsi, fd_set *socks, int *max_socks);
 void spread_handle_message(gcs_info *gcsi, const fd_set *socks);
-
 gcs_group *spread_join(gcs_info *gcsi, const char *group_name,
 					   gcs_group *parent_group);
 void spread_leave(gcs_group *group);
@@ -111,22 +92,21 @@ void spread_unicast(const gcs_group *group, const group_node *node,
 					const void *data, int size);
 
 
-void
-spread_recv(gcs_info *gcsi)
+uint32 
+pgn2id(const char *name)
 {
-	int     err;
-	buffer *b = &GC_DATA(gcsi)->recv_buffer;
+	/* we assume that the name will not exceed the boundary of uint32 currently */
+	int i=0;
+	char c;
+	uint32 r = 0;
 
-	err = SP_poll(GC_DATA(gcsi)->mbox);
-	if(err > 0)
-	{
-		
-	}
-	else
-	{
-		/* no message waiting or error occured, just return */
-		return;
-	}
+	Assert(name != NULL);
+	Assert(name[0] != '\0');
+
+	for(c = name[i]; c != '\0'; ++i)
+		r += (int)c;
+
+	return r;
 }
 
 void
@@ -149,7 +129,63 @@ spread_init(gcs_info *gcsi, char **params)
 	gcsi->funcs.broadcast = &spread_broadcast;
 	gcsi->funcs.unicast = &spread_unicast;
 
-	GC_DATA(gcsi)->spread_name = "4803";
+	strcpy(GC_DATA(gcsi)->spread_name, "4803");
+}
+
+void
+spread_recv(gcs_info *gcsi)
+{
+	int     err;
+
+	err = SP_poll(GC_DATA(gcsi)->mbox);
+	if(err > 0)
+	{
+		err = SP_receive(GC_DATA(gcsi)->mbox,
+		                 &GC_DATA(gcsi)->service_type,
+		                 GC_DATA(gcsi)->sender,
+		                 MAX_MEMBERS,
+		                 &GC_DATA(gcsi)->num_groups,
+		                 GC_DATA(gcsi)->target_groups,
+		                 &GC_DATA(gcsi)->mess_type,
+		                 &GC_DATA(gcsi)->endian_mismatch,
+		                 RECV_BUFFER_SIZE,
+		                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
+
+		if(err < 0)
+		{
+			if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
+			{
+				elog(ERROR, "GC Layer: buffers or groups too short while %s receive msg.",
+				     GC_DATA(gcsi)->private_group_name);
+				elog(ERROR, "GC Layer:   retry with DROP_RECV.");
+				GC_DATA(gcsi)->service_type = DROP_RECV;
+				err = SP_receive(GC_DATA(gcsi)->mbox,
+				                 &GC_DATA(gcsi)->service_type,
+				                 GC_DATA(gcsi)->sender,
+				                 MAX_MEMBERS,
+				                 &GC_DATA(gcsi)->num_groups,
+				                 GC_DATA(gcsi)->target_groups,
+				                 &GC_DATA(gcsi)->mess_type,
+				                 &GC_DATA(gcsi)->endian_mismatch,
+				                 RECV_BUFFER_SIZE,
+				                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
+			}
+			else
+			{
+				elog(ERROR, "GC Layer: error %d while %s receive msg.", err, GC_DATA(gcsi)->private_group_name);
+			}
+		}
+		else
+		{
+			elog(DEBUG3, "GC Layer: %s received %d bytes.", GC_DATA(gcsi)->private_group_name, err);
+		}
+	}
+	else
+	{
+		/* no message waiting or error occured, just return */
+		elog(DEBUG4, "GC Layer: no msg currently.");
+		return;
+	}
 }
 
 void
@@ -176,6 +212,7 @@ spread_connect(gcs_info *gcsi)
 	{
 	    case ACCEPT_SESSION:
 		    elog(DEBUG3, "GC Layer: accept seesion.");
+		    gcsi->conn_state = GCSCS_ESTABLISHED;
 		    break;
 	    case ILLEGAL_SPREAD:
 		    elog(ERROR, "GC Layer: connect error - illegal spread.");
@@ -193,10 +230,8 @@ spread_connect(gcs_info *gcsi)
 		    elog(ERROR, "GC Layer: connect error - reject not unique.");
 	    default:
 		    gcsi_gcs_failed(gcsi);
-		    return;
+		    break;
 	}
-
-	gcsi->conn_state == GCSCS_REQUESTED;
 }
 
 void
@@ -204,39 +239,6 @@ spread_disconnect(gcs_info *gcsi)
 {
 	SP_disconnect(GC_DATA(gcsi)->mbox);
 	pfree(gcsi->data);
-}
-
-void
-spread_multicast(const gcs_info *gcsi,
-				 const spread_service_type service_type,
-				 const gcs_group *group,
-				 const void *data, const int size)
-{
-	int			msg_size;
-	char	   *msg;
-	buffer		b;
-
-	int			msg_type = 0;
-
-	msg_size = 110;
-	msg = palloc(msg_size);
-	init_buffer(&b, msg, msg_size);
-
-	put_int32(&b, Set_endian(service_type));
-	put_data(&b, &GC_DATA(gcsi)->private_group_name, MAX_GROUP_NAME_SIZE);
-	put_int32(&b, 1);		/* number of groups is always one, so far */
-	put_int32(&b, Set_endian((msg_type << 8) && 0x00FFFF00));
-	put_int32(&b, size);
-
-	/* repeat this for multiple groups, if necessary */
-	put_data(&b, group->name, MAX_GROUP_NAME_SIZE);
-
-	if (size > 0)
-	{
-		/* send the real data */
-		Assert(data != NULL);
-		put_data(&b, data, size);
-	}
 }
 
 gcs_group *
@@ -300,6 +302,8 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 	new_group = gc_create_group(gcsi, full_group_name, sizeof(int),
 								sizeof(spread_node));
 	new_group->parent = parent_group;
+	
+	strcpy(GC_DATA(gcsi)->group_name, group_name); 
 
 	return new_group;
 }
@@ -311,7 +315,7 @@ spread_leave(gcs_group *group)
 	Assert(group->gcsi);
 	Assert(group->gcsi->conn_state == GCSCS_ESTABLISHED);
 
-	SP_leave(GC_DATA(gcsi)->mbox, group->name);
+	SP_leave(GC_DATA(group->gcsi)->mbox, group->name);
 	gc_destroy_group(group);
 }
 
@@ -319,10 +323,11 @@ void
 spread_broadcast(const gcs_group *group, const void *data, int size,
 				 bool atomic)
 {
-	int     err;
-	service st;
+	int       err;
+	service   st;
+	gcs_info *gcsi = group->gcsi;
 
-	Assert(group->gcsi->conn_state == GCSCS_ESTABLISHED);
+	Assert(gcsi->conn_state == GCSCS_ESTABLISHED);
 
 	if(atomic)
 		st = RELIABLE_MESS;
@@ -361,12 +366,14 @@ void
 spread_unicast(const gcs_group *group, const group_node *node,
 			   const void *data, int size)
 {
-	int     err;
-	service st;
+	int       err;
+	gcs_info *gcsi = group->gcsi;
+
+	Assert(gcsi->conn_state == GCSCS_ESTABLISHED);
 
 	err = SP_multicast(GC_DATA(gcsi)->mbox,
 	                   RELIABLE_MESS,
-	                   GC_NODE(node)->unicast_group_name,
+	                   GC_NODE(node)->private_group_name,
 	                   0,
 	                   size,
 	                   (const char*)data);
@@ -400,151 +407,84 @@ spread_set_socks(const gcs_info *gcsi, fd_set *socks, int *max_socks)
 void
 spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 {
-	buffer *b;
-	int		err;
-	int		size;
-	int		msg_start;
-	int		auth_answer;
-	char   *authstring;
-	char   *str;
+	int              err;
+	service          st = GC_DATA(gcsi)->service_type;
+	gcs_group       *group;
+	group_node      *node;
+	membership_info  memb_info;
+	buffer          *b  = &(GC_DATA(gcsi)->recv_buffer);
 
-	int		server_version;
-
-	b = &GC_DATA(gcsi)->recv_buffer;
-
-	if (FD_ISSET(GC_DATA(gcsi)->socket, socks))
+	if(Is_regular_mess(st))
 	{
-		elog(NOTICE, "GC Layer: retrieving a message.");
-		spread_recv(gcsi);
-		msg_start = b->ptr;
-
-		if (GC_DATA(gcsi)->state == SPS_INITIALIZING)
+		Assert(GC_DATA(gcsi)->num_groups >= 1);
+		/* we assume msgs are sent to only one group currently */
+		group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
+		Assert(group);
+		node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
+		                   HASH_FIND, NULL);
+		Assert(node);
+		coordinator_handle_gc_message(group, node, 'T', b);
+	}
+	else if(Is_membership_mess(st))
+	{
+		err = SP_get_memb_info(GC_DATA(gcsi)->recv_buffer.data, st, &memb_info);
+		if(err < 0)
 		{
-			elog(NOTICE, "GC Layer: %d bytes in the buffer.",
-				 b->fill_size - b->ptr);
-
-			size = get_int8(b);
-
-			if (get_bytes_read(b) < size)
-			{
-				elog(DEBUG4, "GC Layer: waiting for more data");
-				b->ptr = msg_start;
-				return;
-			}
-
-			if (size > 0)
-			{
-				authstring = palloc(size + 1);
-				get_data(b, authstring, size);
-				authstring[size] = 0;
-
-				if (strncmp(authstring, "NULL", 4) == 0)
-				{
-					pfree(authstring);
-
-					size = MAX_AUTH_NAME * MAX_AUTH_METHODS;
-					authstring = palloc0(size);
-					strcpy(authstring, "NULL");
-
-					err = send(GC_DATA(gcsi)->socket, authstring, size,
-							   MSG_NOSIGNAL);
-					if (err != size)
-					{
-						elog(ERROR,
-							 "GC Layer: error sending join message to "
-							 "server (%s)!\n",
-							 strerror(errno));
-					}
-
-					GC_DATA(gcsi)->state = SPS_AUTHENTICATING;
-					elog(NOTICE, "GC Layer: connected, now authenticating.");
-				}
-				else
-					elog(ERROR, "GC Layer: unsupported auth method: '%s'",
-						 authstring);
-			}
-			else
-			{
-				elog(ERROR, "GC Layer: invalid auth method (size: %d)", size);
-			}
-		}
-		else if (GC_DATA(gcsi)->state == SPS_AUTHENTICATING)
-		{
-			elog(NOTICE, "GC Layer: %d bytes in the buffer.",
-				 b->fill_size - b->ptr);
-
-			auth_answer = get_int8(b);
-
-			elog(NOTICE, "GC Layer: auth answer: %d", auth_answer);
-
-			if (auth_answer != ACCEPT_SESSION)
-				elog(ERROR, "GC Layer: unable to authenticate.");
-			else
-				elog(DEBUG3, "GC Layer: authenticated.");
-
-			if (get_bytes_read(b) < 4)
-			{
-				elog(DEBUG3, "GC Layer: waiting for more data");
-				b->ptr = msg_start;
-				return;
-			}
-
-			server_version = get_int8(b) << 16;
-			server_version |= get_int8(b) << 8;
-			server_version |= get_int8(b);
-
-			if (server_version < 0x030F00)
-				elog(ERROR, "GC Layer: at least spread version 3.15 "
-					 "is required");
-
-			size = get_int8(b);
-
-			if ((b->fill_size - b->ptr) < size)
-			{
-				elog(DEBUG3, "GC Layer: waiting for more data");
-				b->ptr = msg_start;
-				return;
-			}
-
-			b->ptr--;
-
-			str = get_pstring(b);
-			strlcpy(GC_DATA(gcsi)->private_group_name, str,
-					MAX_GROUP_NAME_SIZE);
-			/* FIXME: check return value of strlcpy */
-			pfree(str);
-
-			elog(NOTICE, "GC Layer: private group: %s",
-				 GC_DATA(gcsi)->private_group_name);
-			elog(NOTICE, "GC Layer: %d bytes remaining in the buffer.",
-				 b->fill_size - b->ptr);
-
-			GC_DATA(gcsi)->state = SPS_READY;
-		}
-		else if (GC_DATA(gcsi)->state == SPS_READY)
-		{
-			elog(NOTICE, "GC Layer: received a message in state READY?!?");
-			elog(NOTICE, "GC Layer: %d bytes remaining in the buffer.",
-				 b->fill_size - b->ptr);
+			elog(ERROR, "GC Layer: membership message does not have valid body.");
+			/* FIXME: this is serious, then what? */
 		}
 		else
 		{
-			elog(ERROR, "GC Layer: undefined state");
-		}
+			group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
+			Assert(group);
+			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
+			                   HASH_FIND, NULL);
+			Assert(node);
 
-		if (get_bytes_read(b) == 0)
-		{
-			/* recycle the recv_buffer */
-			b->ptr = 0;
-			b->fill_size = 0;
+			if(Is_caused_join_mess(st))
+			{
+				gcsi_node_changed(group, node, GCVC_JOINED);
+			}
+			else if(Is_caused_leave_mess(st))
+			{
+				gcsi_node_changed(group, node, GCVC_LEFT);
+			}
+			else if(Is_caused_disconnect_mess(st))
+			{
+				gcsi_node_changed(group, node, GCVC_LEFT);
+			}
+			else if(Is_caused_network_mess(st))
+			{
+				elog(ERROR, "GC Layer: got membership message but caused by network.");
+			}
 		}
 	}
+	else if(Is_transition_mess(st))
+	{
+		elog(DEBUG3, "GC Layer: got transition membership message for group %s.", GC_DATA(gcsi)->sender);
+	}
+	else if(Is_reject_mess(st))
+	{
+		elog(DEBUG3, 
+		     "GC Layer: REJECTED msg from %s, of servicetype 0x%x messtype %d, (endian %d) to %d groups : %s",
+		     GC_DATA(gcsi)->sender, 
+		     GC_DATA(gcsi)->service_type, 
+		     GC_DATA(gcsi)->mess_type, 
+		     GC_DATA(gcsi)->endian_mismatch, 
+		     GC_DATA(gcsi)->num_groups, 
+		     b->data);
+	}
+	else
+	{
+		elog(ERROR, "GC Layer: unknown message type 0x%x received.", st);
+	}
 }
-
 
 bool
 spread_is_local(const gcs_group *group, const group_node *node)
 {
-	return 0;
+	group_node* n = hash_search(group->nodes, pgn2id(GC_NODE(node)->private_group_name),
+	                            HASH_FIND, NULL);
+	return n != NULL;
 }
 
