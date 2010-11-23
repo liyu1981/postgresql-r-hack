@@ -15,6 +15,16 @@ mips-sgi-irix* )
 esac
 
 AC_PROG_CC
+unset CFLAGS
+if test "$GCC" = yes; then
+  # liyu: if in debug mode, no O2 please, since it makes debug really annoying   
+  if test "$enable_debug" != yes; then
+    CFLAGS="-O2"
+  else
+    CFLAGS="-g"
+  fi
+fi
+
 AC_C_BIGENDIAN
 
 # Checks for programs.
@@ -81,7 +91,7 @@ AC_ARG_WITH(libs,
 # Checks for libraries.
  OLDLDFLAGS=$LDFLAGS
  LDFLAGS=
-AC_PTHREAD_FREEBSD
+# AC_PTHREAD_FREEBSD
  THLDFLAGS=$LDFLAGS
 AC_SUBST(THLDFLAGS)
  LDFLAGS=$OLDLDFLAGS

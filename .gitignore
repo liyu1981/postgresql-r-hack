@@ -18,6 +18,7 @@
 TAGS
 Makefile
 # single files go below
+configure
 GNUmakefile
 src/backend/access/common/objfiles.txt
 src/backend/access/gin/objfiles.txt

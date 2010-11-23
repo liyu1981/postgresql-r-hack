@@ -5,6 +5,7 @@
 *.[tld][tld][tld]o
 examples/*
 # single files go below
+configure
 daemon/config.h
 daemon/spmonitor
 daemon/spread

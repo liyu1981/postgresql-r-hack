@@ -422,20 +422,20 @@ static	void	Print_menu()
 static	void	Read_message()
 {
 
-	static	char		 mess[MAX_MESSLEN];
-	char		 sender[MAX_GROUP_NAME];
-	char		 target_groups[MAX_MEMBERS][MAX_GROUP_NAME];
-	membership_info  memb_info;
-	vs_set_info      vssets[MAX_VSSETS];
-	unsigned int     my_vsset_index;
-	int              num_vs_sets;
-	char             members[MAX_MEMBERS][MAX_GROUP_NAME];
-	int		 num_groups;
-	int		 service_type;
-	int16		 mess_type;
-	int		 endian_mismatch;
-	int		 i,j;
-	int		 ret;
+	static	char	mess[MAX_MESSLEN];
+	char            sender[MAX_GROUP_NAME];
+	char            target_groups[MAX_MEMBERS][MAX_GROUP_NAME];
+	membership_info memb_info;
+	vs_set_info     vssets[MAX_VSSETS];
+	unsigned int    my_vsset_index;
+	int             num_vs_sets;
+	char            members[MAX_MEMBERS][MAX_GROUP_NAME];
+	int             num_groups;
+	int             service_type;
+	int16           mess_type;
+	int             endian_mismatch;
+	int             i,j;
+	int             ret;
 
 	service_type = 0;
 
@@ -470,8 +470,8 @@ static	void	Read_message()
 		else if( Is_causal_mess(     service_type ) ) printf("received CAUSAL ");
 		else if( Is_agreed_mess(     service_type ) ) printf("received AGREED ");
 		else if( Is_safe_mess(       service_type ) ) printf("received SAFE ");
-		printf("message from %s, of type %d, (endian %d) to %d groups \n(%d bytes): %s\n",
-		       sender, mess_type, endian_mismatch, num_groups, ret, mess );
+		printf("message from %s, of type %d, (endian %d) to %d groups \n[%s ...](%d bytes): %s\n",
+		       sender, mess_type, endian_mismatch, num_groups, target_groups[0], ret, mess );
 	}else if( Is_membership_mess( service_type ) )
 	{
 		ret = SP_get_memb_info( mess, service_type, &memb_info );
