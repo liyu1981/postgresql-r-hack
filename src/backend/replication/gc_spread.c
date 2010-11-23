@@ -213,6 +213,7 @@ spread_connect(gcs_info *gcsi)
 	    case ACCEPT_SESSION:
 		    elog(DEBUG3, "GC Layer: accept seesion.");
 		    gcsi->conn_state = GCSCS_ESTABLISHED;
+		    gcsi_gcs_ready(gcsi);
 		    break;
 	    case ILLEGAL_SPREAD:
 		    elog(ERROR, "GC Layer: connect error - illegal spread.");
@@ -417,13 +418,27 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	if(Is_regular_mess(st))
 	{
 		Assert(GC_DATA(gcsi)->num_groups >= 1);
-		/* we assume msgs are sent to only one group currently */
-		group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
-		Assert(group);
-		node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
-		                   HASH_FIND, NULL);
-		Assert(node);
-		coordinator_handle_gc_message(group, node, 'T', b);
+		if(strcmp(GC_DATA(gcsi)->target_groups[0], 
+		          GC_DATA(gcsi)->private_group_name) == 0)
+		{
+			/* since match the private_group_name, it is from unicast */
+			group = gc_get_group(gcsi, GC_DATA(gcsi)->group_name);
+			Assert(group);
+			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
+			                   HASH_FIND, NULL);
+			Assert(node);
+			coordinator_handle_gc_message(group, node, 'F', b);
+		}
+		else
+		{
+			/* we assume msgs are sent to only one group currently */
+			group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
+			Assert(group);
+			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
+			                   HASH_FIND, NULL);
+			Assert(node);
+			coordinator_handle_gc_message(group, node, 'T', b);
+		}
 	}
 	else if(Is_membership_mess(st))
 	{
@@ -441,6 +456,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			                   HASH_FIND, NULL);
 			Assert(node);
 
+			gcsi_viewchange_start(group);
 			if(Is_caused_join_mess(st))
 			{
 				gcsi_node_changed(group, node, GCVC_JOINED);
@@ -457,6 +473,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			{
 				elog(ERROR, "GC Layer: got membership message but caused by network.");
 			}
+			gcsi_viewchange_stop(group);
 		}
 	}
 	else if(Is_transition_mess(st))

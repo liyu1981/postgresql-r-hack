@@ -15,9 +15,9 @@
 *.status
 *.a
 *~
+# single files go below
 TAGS
 Makefile
-# single files go below
 configure
 GNUmakefile
 src/backend/access/common/objfiles.txt
@@ -169,3 +169,5 @@ src/interfaces/libpq/wchar.c
 src/pl/plpgsql/src/pl_gram.c
 src/pl/plpgsql/src/pl_gram.h
 src/test/regress/pg_regress
+/daemon/config.h
+/stdutil/src/stdutil/private/stdarch_autoconf.h
