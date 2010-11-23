@@ -661,7 +661,20 @@ CoordinatorMain(int argc, char *argv[])
 	/* record Start Time for logging */
 	MyStartTime = time(NULL);
 
-	/* Identify myself via ps */
+    /* liyu: add some code for debuging child process */
+	while(1)
+	{
+		sleep(1);
+		FILE* fp = fopen("/var/pg_child_debug.txt", "r");
+		if(fp != NULL)
+		{
+			fclose(fp);
+			break;
+		}
+	}
+    /* liyu: */
+	
+    /* Identify myself via ps */
 	init_ps_display("coordinator process", "", "", "");
 
 	ereport(LOG,

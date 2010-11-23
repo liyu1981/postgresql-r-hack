@@ -482,7 +482,8 @@ wam_free(void* ptr)
 	desc = *((t_desc_ptr*) addr);
 
 	Assert(desc->sb);
-    Assert((intptr_t) desc > 0xff);
+	/* liyu: based on same reason in wam_check */
+    /* Assert((intptr_t) desc > 0xff); */
 
 	START_CRIT_SECTION();
 	{
@@ -562,7 +563,14 @@ wam_check(void *ptr)
 	addr -= sizeof(Pointer);
 	desc = *((t_desc_ptr*) addr);
 
-    Assert((intptr_t) desc > 0xff);
+	/* liyu: desc is a pointer point to next imsg. This desc is owned
+	   by previous msg so its value should not be some real value, not
+	   just 0xff.
+
+	   Anyway, what's the meaning of > 0xff ? Seems meaningless...
+	 */
+	/* Assert((intptr_t) desc > 0xff); */
+	Assert(desc);
 
 #ifdef MAGIC
 	Assert(*((MAGIC_TYPE*)(addr + desc->heap->sc->sz
