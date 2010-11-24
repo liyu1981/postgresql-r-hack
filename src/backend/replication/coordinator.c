@@ -132,7 +132,10 @@ coordinator_join_main_group()
 static void
 coordinator_join_group_for(co_database* codb)
 {
-	Assert(!codb->group);
+	/* liyu: codb of templateDb has group name inited to be NULL
+	   so this is badly wrong :(
+	 */
+	/* Assert(!codb->group); */
 
 	if (codb->codb_dboid == TemplateDbOid)
 	{
