@@ -155,9 +155,9 @@ spread_recv(gcs_info *gcsi)
 		{
 			if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
 			{
-				elog(ERROR, "GC Layer: buffers or groups too short while %s receive msg.",
+				elog(WARNING, "GC Layer: buffers or groups too short while %s receive msg.",
 				     GC_DATA(gcsi)->private_group_name);
-				elog(ERROR, "GC Layer:   retry with DROP_RECV.");
+				elog(WARNING, "GC Layer:   retry with DROP_RECV.");
 				GC_DATA(gcsi)->service_type = DROP_RECV;
 				err = SP_receive(GC_DATA(gcsi)->mbox,
 				                 &GC_DATA(gcsi)->service_type,
@@ -172,7 +172,7 @@ spread_recv(gcs_info *gcsi)
 			}
 			else
 			{
-				elog(ERROR, "GC Layer: error %d while %s receive msg.", err, GC_DATA(gcsi)->private_group_name);
+				elog(WARNING, "GC Layer: error %d while %s receive msg.", err, GC_DATA(gcsi)->private_group_name);
 			}
 		}
 		else
@@ -298,7 +298,7 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 	    case CONNECTION_CLOSED:
 		    elog(ERROR, "GC Layer: error in joining group: connection closed.");
 	    default:
-		    /* FIXME: */
+		    elog(ERROR, "GC Layer: unknown error %d in joining group.", err);
 		    break;
 	}
 
@@ -349,20 +349,20 @@ spread_broadcast(const gcs_group *group, const void *data, int size,
 	switch(err)
 	{
 	    case ILLEGAL_SESSION:
-		    elog(ERROR, "GC Layer: error in broadcast - illegal session.");
+		    elog(WARNING, "GC Layer: error in broadcast - illegal session.");
 	    case ILLEGAL_MESSAGE:
-		    elog(ERROR, "GC Layer: error in broadcast - illegal message.");
+		    elog(WARNING, "GC Layer: error in broadcast - illegal message.");
 	    case CONNECTION_CLOSED:
+		    /* FIXME: try think again, really need to report ERROR ? */
 		    elog(ERROR, "GC Layer: error in broadcast - connection closed.");
-		    /* FIXME: so what? */
 		    break;
 	    default:
 		    if(err >= 0)
 			    elog(DEBUG4, "GC Layer: %d bytes broadcast.", err);
 		    else
 		    {
+			    /* FIXME: try think again, really need to report ERROR ? */
 			    elog(ERROR, "GC Layer: unknown error %d in broadcast.", err);
-			    /* FIXME: so what? */
 		    }
 	}
 }
@@ -385,20 +385,20 @@ spread_unicast(const gcs_group *group, const group_node *node,
 	switch(err)
 	{
 	    case ILLEGAL_SESSION:
-		    elog(ERROR, "GC Layer: error in broadcast - illegal session.");
+		    elog(WARNING, "GC Layer: error in broadcast - illegal session.");
 	    case ILLEGAL_MESSAGE:
-		    elog(ERROR, "GC Layer: error in broadcast - illegal message.");
+		    elog(WARNING, "GC Layer: error in broadcast - illegal message.");
 	    case CONNECTION_CLOSED:
+		    /* FIXME: try think again, really need to report ERROR ? */
 		    elog(ERROR, "GC Layer: error in broadcast - connection closed.");
-		    /* FIXME: so what? */
 		    break;
 	    default:
 		    if(err >= 0)
 			    elog(DEBUG4, "GC Layer: %d bytes broadcast.", err);
 		    else
 		    {
+			    /* FIXME: try think again, really need to report ERROR ? */
 			    elog(ERROR, "GC Layer: unknown error %d in broadcast.", err);
-			    /* FIXME: so what? */
 		    }
 	}
 }
@@ -449,7 +449,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		err = SP_get_memb_info(GC_DATA(gcsi)->recv_buffer.data, st, &memb_info);
 		if(err < 0)
 		{
-			elog(ERROR, "GC Layer: membership message does not have valid body.");
+			elog(WARNING, "GC Layer: membership message does not have valid body.");
 			/* FIXME: this is serious, then what? */
 		}
 		else
@@ -475,7 +475,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			}
 			else if(Is_caused_network_mess(st))
 			{
-				elog(ERROR, "GC Layer: got membership message but caused by network.");
+				elog(WARNING, "GC Layer: got membership message but caused by network.");
 			}
 			gcsi_viewchange_stop(group);
 		}
@@ -497,7 +497,21 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	}
 	else
 	{
-		elog(ERROR, "GC Layer: unknown message type 0x%x received.", st);
+		/* liyu: this can NOT be ERROR, since ERROR will cause us jump
+		   back to coordinator.c:738, which turns out will continue to
+		   reinvoke populate_co_database ...  ( sort of sigsetjmp and
+		   siglongjmp programming, really bad in PG ... :( )
+		   
+		   so, brief conclusion here: 
+
+		   1.  report ERROR will cause the coordinator try to
+		       re-populate_co_database and re-connect-join spread. If
+		       you feel it is a serious error in spread, just report
+		       it 
+
+		   2.  otherwise, do not report ERROR...
+		 */
+		elog(WARNING, "GC Layer: unknown message type 0x%x received.", st);
 	}
 }
 
