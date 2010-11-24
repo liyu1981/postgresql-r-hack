@@ -660,6 +660,11 @@ CoordinatorMain(int argc, char *argv[])
 
 	/* record Start Time for logging */
 	MyStartTime = time(NULL);
+	
+    /* Identify myself via ps */
+	init_ps_display("coordinator process", "", "", "");
+
+	elog(LOG, "Coordinator started with pid %d", MyProcPid);
 
     /* liyu: add some code for debuging child process */
 	while(1)
@@ -673,12 +678,6 @@ CoordinatorMain(int argc, char *argv[])
 		}
 	}
     /* liyu: */
-	
-    /* Identify myself via ps */
-	init_ps_display("coordinator process", "", "", "");
-
-	ereport(LOG,
-			(errmsg("coordinator started")));
 
 	if (PostAuthDelay)
 		pg_usleep(PostAuthDelay * 1000000L);
