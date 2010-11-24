@@ -211,8 +211,10 @@ spread_connect(gcs_info *gcsi)
 	switch(err) 
 	{
 	    case ACCEPT_SESSION:
-		    elog(DEBUG3, "GC Layer: accept seesion.");
 		    gcsi->conn_state = GCSCS_ESTABLISHED;
+		    elog(LOG, "GC Layer: connection established to spread daemon %s with private name %s.",
+		         GC_DATA(gcsi)->spread_name,
+		         GC_DATA(gcsi)->private_group_name);
 		    gcsi_gcs_ready(gcsi);
 		    break;
 	    case ILLEGAL_SPREAD:
@@ -305,6 +307,8 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 	new_group->parent = parent_group;
 	
 	strcpy(GC_DATA(gcsi)->group_name, group_name); 
+
+	elog(LOG, "GC Layer: joined group %s.", group_name);
 
 	return new_group;
 }
