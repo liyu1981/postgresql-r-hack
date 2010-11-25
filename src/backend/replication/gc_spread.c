@@ -31,8 +31,9 @@
 #define GC_DATA(gcsi) ((spread_data*)((gcsi)->data))
 #define GC_NODE(node) ((spread_node*)((node)->gcs_node))
 
-#define RECV_BUFFER_SIZE 2048
+#define RECV_BUFFER_SIZE 102400
 #define MAX_MEMBERS      100
+#define MAX_VSSETS       100
 
 typedef enum
 {
@@ -415,12 +416,21 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	int              err;
 	service          st = GC_DATA(gcsi)->service_type;
 	gcs_group       *group;
+	spread_node     *sp_node;
 	group_node      *node;
+	vs_set_info      vssets[MAX_VSSETS];
 	membership_info  memb_info;
+	int              num_vs_sets;
+	unsigned int     my_vsset_index;
+	char             members[MAX_MEMBERS][MAX_GROUP_NAME];
 	buffer          *b  = &(GC_DATA(gcsi)->recv_buffer);
+	int              i,j;
+	bool             found;
+	int              id;
 
 	if(Is_regular_mess(st))
 	{
+		id = pgn2id(&GC_DATA(gcsi)->sender);
 		Assert(GC_DATA(gcsi)->num_groups >= 1);
 		if(strcmp(GC_DATA(gcsi)->target_groups[0], 
 		          GC_DATA(gcsi)->private_group_name) == 0)
@@ -428,8 +438,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			/* since match the private_group_name, it is from unicast */
 			group = gc_get_group(gcsi, GC_DATA(gcsi)->group_name);
 			Assert(group);
-			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
-			                   HASH_FIND, NULL);
+			node = hash_search(group->nodes, id, HASH_FIND, NULL);
 			Assert(node);
 			coordinator_handle_gc_message(group, node, 'F', b);
 		}
@@ -438,51 +447,179 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			/* we assume msgs are sent to only one group currently */
 			group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
 			Assert(group);
-			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
-			                   HASH_FIND, NULL);
+			node = hash_search(group->nodes, id, HASH_FIND, NULL);
 			Assert(node);
 			coordinator_handle_gc_message(group, node, 'T', b);
 		}
 	}
 	else if(Is_membership_mess(st))
 	{
-		err = SP_get_memb_info(GC_DATA(gcsi)->recv_buffer.data, st, &memb_info);
+		err = SP_get_memb_info(b->data, st, &memb_info);
 		if(err < 0)
 		{
-			elog(WARNING, "GC Layer: membership message does not have valid body.");
-			/* FIXME: this is serious, then what? */
+			elog(ERROR, "GC Layer: membership message does not have valid body.");
+		}
+
+		if(Is_reg_memb_mess(st))
+		{
+			if(Is_caused_join_mess(st))
+			{
+				elog(LOG, "GC Layer: node %s joined group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+
+				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+				Assert(group);
+				gcsi_viewchange_start(group);
+
+				id = pgn2id(memb_info.changed_member);
+				sp_node = hash_search(group->nodes, id, HASH_ENTER, &found);
+				if(found)
+				{
+					elog(DEBUG3, "GC Layer: node %s already in group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+					node = gcsi_get_node(group, sp_node->node_id);
+					Assert(node);
+				}
+				else
+				{
+					/*
+					 * we have just added a new node, tell the
+					 * coordinator, too.
+					 */
+					node = gcsi_add_node(group, id);
+					node->gcs_node = sp_node;
+					strcpy(sp_node->private_group_name, memb_info.changed_member);
+					sp_node->id = id;
+					sp_node->node_id = node->id;
+
+					if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
+					{
+						group->node_id_self_ref = node->id;
+					}
+				}
+				
+				gcsi_node_changed(group, node, GCVC_JOINED);
+				
+				gcsi_viewchange_stop(group);
+			} /* finish join mess */
+			else if(Is_caused_leave_mess(st))
+			{
+				elog(LOG, "GC Layer: node %s leave group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+
+				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+				Assert(group);
+				gcsi_viewchange_start(group);
+
+				id = pgn2id(memb_info.changed_member);
+				sp_node = hash_search(group->nodes, id, HASH_FIND, &found);
+				if(found)
+				{
+					node = gcsi_get_node(group, sp_node->node_id);
+					Assert(node);
+					gcsi_node_changed(group, node, GCVC_LEFT);
+				}
+
+				gcsi_viewchange_stop(group);
+			} /* finish leave mess */
+			else if(Is_caused_disconnect_mess(st))
+			{
+				elog(LOG, "GC Layer: node %s disconnect from group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+				
+				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+				Assert(group);
+				gcsi_viewchange_start(group);
+
+				id = pgn2id(memb_info.changed_member);
+				sp_node = hash_search(group->nodes, id, HASH_FIND, &found);
+				if(found)
+				{
+					node = gcsi_get_node(group, sp_node->node_id);
+					Assert(node);
+					gcsi_node_changed(group, node, GCVC_LEFT);
+				}
+
+				gcsi_viewchange_stop(group);
+			} /* finish disconnect mess */
+			else if(Is_caused_network_mess(st))
+			{
+				elog(LOG, "GC Layer: Due to NETWORK change with %u VS sets\n", memb_info.num_vs_sets);
+				
+				num_vs_sets = SP_get_vs_sets_info(b->data, &vssets[0], MAX_VSSETS, &my_vsset_index);
+				if (num_vs_sets < 0) {
+					elog(PANIC, "GC Layer: membership message has more then %d vs sets. Recompile with larger MAX_VSSETS.",
+					     MAX_VSSETS);
+				}
+
+				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+				if(group == NULL)
+				{
+					/* the group even not exist, create new one */
+					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender, sizeof(int), sizeof(spread_node));
+				}
+				else
+				{
+					/* otherwise we first drop the group, then create new one 
+
+					   Note: after that, we will create/add back all
+					   node.  This is a simple way comparing to add
+					   new node and remove exist node, especially
+					   considering that the HTAB does not have a
+					   sequential scan method ... or I do not know yet
+					   :(
+					 */
+					gc_destroy_group(group);
+					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender, sizeof(int), sizeof(spread_node));
+				}
+
+				gcsi_viewchange_start(group);
+
+				for(i = 0; i < num_vs_sets; i++)
+				{
+					elog(LOG, "GC Layer: %s VS set %d has %u members:\n",
+					       (i  == my_vsset_index) ?
+					       ("LOCAL") : ("OTHER"), i, vssets[i].num_members);
+
+					err = SP_get_vs_set_members(b->data, &vssets[i], members, MAX_MEMBERS);
+					if(err < 0)
+					{
+						elog(PANIC, "GC Layer: VS Set has more then %d members. Recompile with larger MAX_MEMBERS.",
+						     MAX_MEMBERS);
+					}
+
+					for(j = 0; j < vssets[i].num_members; j++)
+					{
+						id = pgn2id(members[j]);
+						sp_node = hash_search(group->nodes, id, HASH_ENTER, &found);
+						node = gcsi_add_node(group, id);
+						node->gcs_node = sp_node;
+						strcpy(sp_node->private_group_name, members[j]);
+						sp_node->id = id;
+						sp_node->node_id = node->id;
+
+						if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
+						{
+							group->node_id_self_ref = node->id;
+						}
+					}
+				}
+
+				gcsi_viewchange_stop(group);
+			} /* finish network mess */
+			else
+			{
+				elog(WARNING, "GC Layer: unknown regular membership message 0x%x received.", st);
+			}
+		}
+		else if(Is_transition_mess(st))
+		{
+			elog(DEBUG3, "GC Layer: got transition membership message for group %s.", GC_DATA(gcsi)->sender);
+		}
+		else if(Is_caused_leave_mess(st))
+		{
+			elog(DEBUG3, "GC Layer: received membership message the left group %s.", GC_DATA(gcsi)->sender);
 		}
 		else
 		{
-			group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
-			Assert(group);
-			node = hash_search(group->nodes, pgn2id(&GC_DATA(gcsi)->sender),
-			                   HASH_FIND, NULL);
-			Assert(node);
-
-			gcsi_viewchange_start(group);
-			if(Is_caused_join_mess(st))
-			{
-				gcsi_node_changed(group, node, GCVC_JOINED);
-			}
-			else if(Is_caused_leave_mess(st))
-			{
-				gcsi_node_changed(group, node, GCVC_LEFT);
-			}
-			else if(Is_caused_disconnect_mess(st))
-			{
-				gcsi_node_changed(group, node, GCVC_LEFT);
-			}
-			else if(Is_caused_network_mess(st))
-			{
-				elog(WARNING, "GC Layer: got membership message but caused by network.");
-			}
-			gcsi_viewchange_stop(group);
+			elog(WARNING, "GC Layer: received incorrecty membership message of type 0x%x.", st);
 		}
-	}
-	else if(Is_transition_mess(st))
-	{
-		elog(DEBUG3, "GC Layer: got transition membership message for group %s.", GC_DATA(gcsi)->sender);
 	}
 	else if(Is_reject_mess(st))
 	{
