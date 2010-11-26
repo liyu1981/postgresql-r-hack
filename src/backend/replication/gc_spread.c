@@ -435,7 +435,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	bool             found;
 	int              id;
 
+#ifdef DEBUG
 	spread_data *sp_data = GC_DATA(gcsi);
+#endif
 
 	Assert(GC_DATA(gcsi)->recv_flag == false);
 
@@ -568,7 +570,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					elog(LOG, "GC Layer: Due to NETWORK change with %u VS sets\n",
 					     memb_info.num_vs_sets);
 				
-					num_vs_sets = SP_get_vs_sets_info(b->data, &vssets[0], MAX_VSSETS, &my_vsset_index);
+					num_vs_sets = SP_get_vs_sets_info(b->data, &vssets[0],
+					                                  MAX_VSSETS, &my_vsset_index);
 					if (num_vs_sets < 0) {
 						elog(PANIC, "GC Layer: membership message has more then %d vs sets. \
                                  Recompile with larger MAX_VSSETS.",
