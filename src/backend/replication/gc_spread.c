@@ -173,12 +173,14 @@ spread_recv(gcs_info *gcsi)
 			}
 			else
 			{
-				elog(WARNING, "GC Layer: error %d while %s receive msg.", err, GC_DATA(gcsi)->private_group_name);
+				elog(WARNING, "GC Layer: error %d while %s receive msg.",
+				     err, GC_DATA(gcsi)->private_group_name);
 			}
 		}
 		else
 		{
-			elog(DEBUG3, "GC Layer: %s received %d bytes.", GC_DATA(gcsi)->private_group_name, err);
+			elog(DEBUG3, "GC Layer: %s received %d bytes.",
+			     GC_DATA(gcsi)->private_group_name, err);
 		}
 	}
 	else
@@ -202,11 +204,15 @@ spread_connect(gcs_info *gcsi)
 	/* set correct state */
 	GC_DATA(gcsi)->state = SPS_INITIALIZING;
 
-	err = SP_connect(GC_DATA(gcsi)->spread_name,         /* spread_name: local daemon @ 4803 will be connected */ 
-	                 NULL,                               /* private_name: let spread gives one, so use NULL */
-	                 0,                                  /* priority: this has no effect according to spread document */
-	                 1,                                  /* group_membership: 1 - yes, we want membership messages */
-	                 &GC_DATA(gcsi)->mbox,               /* mbox: */
+	err = SP_connect(GC_DATA(gcsi)->spread_name,         
+                     /* spread_name: local daemon @ 4803 will be connected */ 
+	                 NULL,
+	                 /* private_name: let spread gives one, so use NULL */
+	                 0,
+	                 /* priority: this has no effect according to spread document */
+	                 1,
+	                 /* group_membership: 1 - yes, we want membership messages */
+	                 &GC_DATA(gcsi)->mbox,
 	                 GC_DATA(gcsi)->private_group_name);
 
 	switch(err) 
@@ -464,7 +470,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		{
 			if(Is_caused_join_mess(st))
 			{
-				elog(LOG, "GC Layer: node %s joined group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+				elog(LOG, "GC Layer: node %s joined group %s.",
+				     memb_info.changed_member, GC_DATA(gcsi)->sender);
 
 				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 				Assert(group);
@@ -474,7 +481,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 				sp_node = hash_search(group->nodes, id, HASH_ENTER, &found);
 				if(found)
 				{
-					elog(DEBUG3, "GC Layer: node %s already in group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+					elog(DEBUG3, "GC Layer: node %s already in group %s.",
+					     memb_info.changed_member, GC_DATA(gcsi)->sender);
 					node = gcsi_get_node(group, sp_node->node_id);
 					Assert(node);
 				}
@@ -502,7 +510,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			} /* finish join mess */
 			else if(Is_caused_leave_mess(st))
 			{
-				elog(LOG, "GC Layer: node %s leave group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+				elog(LOG, "GC Layer: node %s leave group %s.",
+				     memb_info.changed_member, GC_DATA(gcsi)->sender);
 
 				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 				Assert(group);
@@ -521,7 +530,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			} /* finish leave mess */
 			else if(Is_caused_disconnect_mess(st))
 			{
-				elog(LOG, "GC Layer: node %s disconnect from group %s.", memb_info.changed_member, GC_DATA(gcsi)->sender);
+				elog(LOG, "GC Layer: node %s disconnect from group %s.",
+				     memb_info.changed_member, GC_DATA(gcsi)->sender);
 				
 				group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 				Assert(group);
@@ -540,11 +550,13 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			} /* finish disconnect mess */
 			else if(Is_caused_network_mess(st))
 			{
-				elog(LOG, "GC Layer: Due to NETWORK change with %u VS sets\n", memb_info.num_vs_sets);
+				elog(LOG, "GC Layer: Due to NETWORK change with %u VS sets\n",
+				     memb_info.num_vs_sets);
 				
 				num_vs_sets = SP_get_vs_sets_info(b->data, &vssets[0], MAX_VSSETS, &my_vsset_index);
 				if (num_vs_sets < 0) {
-					elog(PANIC, "GC Layer: membership message has more then %d vs sets. Recompile with larger MAX_VSSETS.",
+					elog(PANIC, "GC Layer: membership message has more then %d vs sets. \
+                                 Recompile with larger MAX_VSSETS.",
 					     MAX_VSSETS);
 				}
 
@@ -552,7 +564,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 				if(group == NULL)
 				{
 					/* the group even not exist, create new one */
-					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender, sizeof(int), sizeof(spread_node));
+					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender,
+					                        sizeof(int), sizeof(spread_node));
 				}
 				else
 				{
@@ -566,7 +579,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					   :(
 					 */
 					gc_destroy_group(group);
-					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender, sizeof(int), sizeof(spread_node));
+					group = gc_create_group(gcsi, GC_DATA(gcsi)->sender,
+					                        sizeof(int), sizeof(spread_node));
 				}
 
 				gcsi_viewchange_start(group);
@@ -580,7 +594,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					err = SP_get_vs_set_members(b->data, &vssets[i], members, MAX_MEMBERS);
 					if(err < 0)
 					{
-						elog(PANIC, "GC Layer: VS Set has more then %d members. Recompile with larger MAX_MEMBERS.",
+						elog(PANIC, "GC Layer: VS Set has more then %d members. \
+                                     Recompile with larger MAX_MEMBERS.",
 						     MAX_MEMBERS);
 					}
 
@@ -610,11 +625,13 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		}
 		else if(Is_transition_mess(st))
 		{
-			elog(DEBUG3, "GC Layer: got transition membership message for group %s.", GC_DATA(gcsi)->sender);
+			elog(DEBUG3, "GC Layer: got transition membership message for group %s.",
+			     GC_DATA(gcsi)->sender);
 		}
 		else if(Is_caused_leave_mess(st))
 		{
-			elog(DEBUG3, "GC Layer: received membership message the left group %s.", GC_DATA(gcsi)->sender);
+			elog(DEBUG3, "GC Layer: received membership message the left group %s.",
+			     GC_DATA(gcsi)->sender);
 		}
 		else
 		{
@@ -624,7 +641,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	else if(Is_reject_mess(st))
 	{
 		elog(DEBUG3, 
-		     "GC Layer: REJECTED msg from %s, of servicetype 0x%x messtype %d, (endian %d) to %d groups : %s",
+		     "GC Layer: REJECTED msg from %s, of servicetype 0x%x messtype %d,\
+              (endian %d) to %d groups : %s",
 		     GC_DATA(gcsi)->sender, 
 		     GC_DATA(gcsi)->service_type, 
 		     GC_DATA(gcsi)->mess_type, 
