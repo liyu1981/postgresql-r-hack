@@ -74,6 +74,14 @@ typedef struct
 	uint32		node_id;
 } spread_node;
 
+#define RESET_GCSI_NAMES(x) \
+	memset(GC_DATA((x))->group_name, 0, MAX_GROUP_NAME); \
+	memset(GC_DATA((x))->private_group_name, 0, MAX_GROUP_NAME)
+
+#define RESET_GCSI_RECV(x) \
+		memset(GC_DATA((x))->sender, 0, MAX_GROUP_NAME); \
+		memset(GC_DATA((x))->target_groups, 0, MAX_GROUP_NAME*MAX_MEMBERS); \
+		memset(GC_DATA((x))->members, 0, MAX_GROUP_NAME*MAX_MEMBERS)
 
 /* prototypes */
 uint32 pgn2id(const char *name);
@@ -105,8 +113,13 @@ pgn2id(const char *name)
 	Assert(name != NULL);
 	Assert(name[0] != '\0');
 
-	for(c = name[i]; c != '\0'; ++i)
+	for( ; ; ++i)
+	{
+		c = name[i];
+		if((int)c == 0)
+			break;
 		r += (int)c;
+	}
 
 	return r;
 }
@@ -117,8 +130,9 @@ spread_init(gcs_info *gcsi, char **params)
 	gcsi->data = palloc(sizeof(spread_data));
 	init_buffer(&GC_DATA(gcsi)->recv_buffer, palloc(RECV_BUFFER_SIZE),
 	            RECV_BUFFER_SIZE);
-	GC_DATA(gcsi)->group_name[0] = '\0'; /* make the init name to be empty */
-	GC_DATA(gcsi)->private_group_name[0] = '\0';
+	/* should be really carefull, since stupid spread will not attach
+	 * '\0' for the group name */
+	RESET_GCSI_NAMES(gcsi);
 	GC_DATA(gcsi)->recv_flag = false; /* init the recv flag */
 
 	gc_init_groups_hash(gcsi);
@@ -148,6 +162,8 @@ spread_recv(gcs_info *gcsi)
 	err = SP_poll(GC_DATA(gcsi)->mbox);
 	if(err > 0)
 	{
+		RESET_GCSI_RECV(gcsi);
+
 		err = SP_receive(GC_DATA(gcsi)->mbox,
 		                 &GC_DATA(gcsi)->service_type,
 		                 GC_DATA(gcsi)->sender,
@@ -461,7 +477,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 				/* since match the private_group_name, it is from unicast */
 				group = gc_get_group(gcsi, GC_DATA(gcsi)->group_name);
 				Assert(group);
-				node = hash_search(group->nodes, id, HASH_FIND, NULL);
+				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
 				Assert(node);
 				coordinator_handle_gc_message(group, node, 'F', b);
 			}
@@ -470,7 +486,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 				/* we assume msgs are sent to only one group currently */
 				group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
 				Assert(group);
-				node = hash_search(group->nodes, id, HASH_FIND, NULL);
+				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
 				Assert(node);
 				coordinator_handle_gc_message(group, node, 'T', b);
 			}
@@ -495,7 +511,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, id, HASH_ENTER, &found);
+					sp_node = hash_search(group->nodes, &id, HASH_ENTER, &found);
 					if(found)
 					{
 						elog(DEBUG3, "GC Layer: node %s already in group %s.",
@@ -535,7 +551,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, id, HASH_FIND, &found);
+					sp_node = hash_search(group->nodes, &id, HASH_FIND, &found);
 					if(found)
 					{
 						node = gcsi_get_node(group, sp_node->node_id);
@@ -555,7 +571,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, id, HASH_FIND, &found);
+					sp_node = hash_search(group->nodes, &id, HASH_FIND, &found);
 					if(found)
 					{
 						node = gcsi_get_node(group, sp_node->node_id);
@@ -609,6 +625,10 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 						     (i  == my_vsset_index) ?
 						     ("LOCAL") : ("OTHER"), i, vssets[i].num_members);
 
+						/* must reset, since stupid spread will not
+						 * attach '\0' for us */
+						memset(members, 0, MAX_MEMBERS*MAX_GROUP_NAME);
+
 						err = SP_get_vs_set_members(b->data, &vssets[i], members, MAX_MEMBERS);
 						if(err < 0)
 						{
@@ -620,7 +640,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 						for(j = 0; j < vssets[i].num_members; j++)
 						{
 							id = pgn2id(members[j]);
-							sp_node = hash_search(group->nodes, id, HASH_ENTER, &found);
+							sp_node = hash_search(group->nodes, &id, HASH_ENTER, &found);
 							node = gcsi_add_node(group, id);
 							node->gcs_node = sp_node;
 							strcpy(sp_node->private_group_name, members[j]);
