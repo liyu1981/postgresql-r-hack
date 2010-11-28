@@ -847,7 +847,8 @@ CoordinatorMain(int argc, char *argv[])
 		socket_ready = false;
 
 #ifdef REPLICATION
-		coordinator_replication_reg_gcs(&socks, &max_sock_id);
+		/* FIX ME: spread does not use sockets, dirty hack currently */
+		/* coordinator_replication_reg_gcs(&socks, &max_sock_id); */
 #endif
 
 #ifdef COORDINATOR_DEBUG
@@ -885,26 +886,28 @@ CoordinatorMain(int argc, char *argv[])
 		sigaddset(&sigmask, SIGUSR2);
 		sigprocmask(SIG_BLOCK, &sigmask, &oldmask);
 
+		/* FIX ME: dirtly hack, just comment out checking socket since
+		 * spread does not use it */
 		/*
 		 * Final check for the (now blocked) signals. Prevent waiting on
 		 * events on the file descriptors with pselect(), if we've already
 		 * gotten a signal.
 		 */
-		if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP)
-		{
-			sigemptyset(&sigmask);
-			if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap,
-						&sigmask) < 0)
-			{	
-				if (errno != EINTR)
-				{
-					elog(WARNING, "Coordinator: pselect failed: %m");
-					socket_ready = true;
-				}
-			}
-			else
-				socket_ready = true;
-		}
+		/* if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP) */
+		/* { */
+		/* 	sigemptyset(&sigmask); */
+		/* 	if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap, */
+		/* 				&sigmask) < 0) */
+		/* 	{	 */
+		/* 		if (errno != EINTR) */
+		/* 		{ */
+		/* 			elog(WARNING, "Coordinator: pselect failed: %m"); */
+		/* 			socket_ready = true; */
+		/* 		} */
+		/* 	} */
+		/* 	else */
+		/* 		socket_ready = true; */
+		/* } */
 
 		sigprocmask(SIG_SETMASK, &oldmask, NULL);
 
@@ -974,13 +977,18 @@ CoordinatorMain(int argc, char *argv[])
 			continue;
 		}
 
+		/* liyu: different to socket based egcs implementation, check
+		 * socket (=recv msg) each possible time. The efficiency
+		 * should not be problem, since the spread_recv will do a
+		 * check. */
 		/* handle sockets with pending reads */
-		if (socket_ready)
-		{
+		/* if (socket_ready) */
+		/* { */
 #ifdef REPLICATION
+		if (replication_enabled)
 			coordinator_replication_check_sockets(&socks);
 #endif
-		}
+		/* } */
 
 		/* handle pending imessages */
 		while ((msg = IMessageCheck()) != NULL)
