@@ -78,10 +78,13 @@ typedef struct
 	memset(GC_DATA((x))->group_name, 0, MAX_GROUP_NAME); \
 	memset(GC_DATA((x))->private_group_name, 0, MAX_GROUP_NAME)
 
-#define RESET_GCSI_RECV(x) \
-		memset(GC_DATA((x))->sender, 0, MAX_GROUP_NAME); \
-		memset(GC_DATA((x))->target_groups, 0, MAX_GROUP_NAME*MAX_MEMBERS); \
-		memset(GC_DATA((x))->members, 0, MAX_GROUP_NAME*MAX_MEMBERS)
+#define RESET_GCSI_RECV(x)	  \
+	memset(GC_DATA((x))->sender, 0, MAX_GROUP_NAME); \
+	memset(GC_DATA((x))->target_groups, 0, MAX_GROUP_NAME*MAX_MEMBERS); \
+	memset(GC_DATA((x))->members, 0, MAX_GROUP_NAME*MAX_MEMBERS)
+
+#define RESET_SPREAD_NODE(x) \
+	memset((x)->private_group_name, 0, MAX_GROUP_NAME)
 
 /* prototypes */
 uint32 pgn2id(const char *name);
@@ -271,11 +274,15 @@ spread_disconnect(gcs_info *gcsi)
 gcs_group *
 spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 {
-	int        err;
-	gcs_group *new_group;
-	gcs_group *pgroup;
-	int		   i, j, full_group_name_len;
-	char	  *full_group_name;
+	int          err;
+	gcs_group   *new_group;
+	gcs_group   *pgroup;
+	int          i, j, full_group_name_len;
+	char        *full_group_name;
+	int          id;
+	bool         found;
+	group_node  *node;
+	spread_node *sp_node;
 
 	Assert(gcsi->conn_state == GCSCS_ESTABLISHED);
 
@@ -326,13 +333,34 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 		    break;
 	}
 
-	new_group = gc_create_group(gcsi, full_group_name, sizeof(int),
-								sizeof(spread_node));
+	new_group = gc_create_group(gcsi, full_group_name, sizeof(int), sizeof(spread_node));
 	new_group->parent = parent_group;
-	
 	strcpy(GC_DATA(gcsi)->group_name, group_name); 
 
+	/* and add self as the first node */
+
 	elog(LOG, "GC Layer: joined group %s.", group_name);
+
+	gcsi_viewchange_start(new_group);
+
+	id = pgn2id(GC_DATA(gcsi)->private_group_name);
+	sp_node = hash_search(new_group->gcs_nodes, &id, HASH_ENTER, &found);
+	Assert(!found);
+	RESET_SPREAD_NODE(sp_node);
+	node = gcsi_add_node(new_group, id);
+	node->gcs_node = sp_node;
+	strcpy(sp_node->private_group_name, GC_DATA(gcsi)->private_group_name);
+	sp_node->id = id;
+	sp_node->node_id = node->id;
+
+	if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
+	{
+		new_group->node_id_self_ref = node->id;
+	}
+				
+	gcsi_node_changed(new_group, node, GCVC_JOINED);
+				
+	gcsi_viewchange_stop(new_group);
 
 	return new_group;
 }
@@ -451,9 +479,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	bool             found;
 	int              id;
 
-#ifdef DEBUG
+//#ifdef DEBUG
 	spread_data *sp_data = GC_DATA(gcsi);
-#endif
+//#endif
 
 	Assert(GC_DATA(gcsi)->recv_flag == false);
 
@@ -503,15 +531,12 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			{
 				if(Is_caused_join_mess(st))
 				{
-					elog(LOG, "GC Layer: node %s joined group %s.",
-					     memb_info.changed_member, GC_DATA(gcsi)->sender);
-
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, &id, HASH_ENTER, &found);
+					sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
 					if(found)
 					{
 						elog(DEBUG3, "GC Layer: node %s already in group %s.",
@@ -525,6 +550,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 						 * we have just added a new node, tell the
 						 * coordinator, too.
 						 */
+						RESET_SPREAD_NODE(sp_node);
 						node = gcsi_add_node(group, id);
 						node->gcs_node = sp_node;
 						strcpy(sp_node->private_group_name, memb_info.changed_member);
@@ -540,18 +566,21 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					gcsi_node_changed(group, node, GCVC_JOINED);
 				
 					gcsi_viewchange_stop(group);
+
+					hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
+					Assert(found);
+
+					elog(LOG, "GC Layer: node %s joined group %s.",
+					     memb_info.changed_member, GC_DATA(gcsi)->sender);
 				} /* finish join mess */
 				else if(Is_caused_leave_mess(st))
 				{
-					elog(LOG, "GC Layer: node %s leave group %s.",
-					     memb_info.changed_member, GC_DATA(gcsi)->sender);
-
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, &id, HASH_FIND, &found);
+					sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
 					if(found)
 					{
 						node = gcsi_get_node(group, sp_node->node_id);
@@ -560,18 +589,18 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					}
 
 					gcsi_viewchange_stop(group);
+
+					elog(LOG, "GC Layer: node %s leave group %s.",
+					     memb_info.changed_member, GC_DATA(gcsi)->sender);
 				} /* finish leave mess */
 				else if(Is_caused_disconnect_mess(st))
 				{
-					elog(LOG, "GC Layer: node %s disconnect from group %s.",
-					     memb_info.changed_member, GC_DATA(gcsi)->sender);
-				
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
 
 					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->nodes, &id, HASH_FIND, &found);
+					sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
 					if(found)
 					{
 						node = gcsi_get_node(group, sp_node->node_id);
@@ -580,6 +609,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					}
 
 					gcsi_viewchange_stop(group);
+
+					elog(LOG, "GC Layer: node %s disconnect from group %s.",
+					     memb_info.changed_member, GC_DATA(gcsi)->sender);
 				} /* finish disconnect mess */
 				else if(Is_caused_network_mess(st))
 				{
@@ -640,7 +672,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 						for(j = 0; j < vssets[i].num_members; j++)
 						{
 							id = pgn2id(members[j]);
-							sp_node = hash_search(group->nodes, &id, HASH_ENTER, &found);
+							sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
+							RESET_SPREAD_NODE(sp_node);
 							node = gcsi_add_node(group, id);
 							node->gcs_node = sp_node;
 							strcpy(sp_node->private_group_name, members[j]);
@@ -714,8 +747,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 bool
 spread_is_local(const gcs_group *group, const group_node *node)
 {
-	group_node* n = hash_search(group->nodes, pgn2id(GC_NODE(node)->private_group_name),
-	                            HASH_FIND, NULL);
+	int id = pgn2id(GC_NODE(node)->private_group_name);
+	group_node* n = hash_search(group->nodes, &id, HASH_FIND, NULL);
 	return n != NULL;
 }
-
