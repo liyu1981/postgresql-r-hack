@@ -46,7 +46,6 @@ typedef struct
 {
 	char    spread_name[MAX_GROUP_NAME];
 	mailbox mbox;
-	char    group_name[MAX_GROUP_NAME];
 	char    private_group_name[MAX_GROUP_NAME];
 
 	spread_state state;
@@ -83,7 +82,6 @@ typedef struct
 } spread_node;
 
 #define RESET_GCSI_NAMES(x) \
-	memset(GC_DATA((x))->group_name, 0, MAX_GROUP_NAME); \
 	memset(GC_DATA((x))->private_group_name, 0, MAX_GROUP_NAME)
 
 #define RESET_GCSI_RECV(x)	  \
@@ -287,10 +285,6 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 	gcs_group   *pgroup;
 	int          i, j, full_group_name_len;
 	char        *full_group_name;
-	int          id;
-	bool         found;
-	group_node  *node;
-	spread_node *sp_node;
 
 	Assert(gcsi->conn_state == GCSCS_ESTABLISHED);
 
@@ -343,32 +337,10 @@ spread_join(gcs_info *gcsi, const char *group_name, gcs_group *parent_group)
 
 	new_group = gc_create_group(gcsi, full_group_name, sizeof(int), sizeof(spread_node));
 	new_group->parent = parent_group;
-	strcpy(GC_DATA(gcsi)->group_name, group_name); 
 
 	/* and add self as the first node */
 
-	elog(LOG, "GC Layer: joined group %s.", group_name);
-
-	gcsi_viewchange_start(new_group);
-
-	id = pgn2id(GC_DATA(gcsi)->private_group_name);
-	sp_node = hash_search(new_group->gcs_nodes, &id, HASH_ENTER, &found);
-	Assert(!found);
-	RESET_SPREAD_NODE(sp_node);
-	node = gcsi_add_node(new_group, id);
-	node->gcs_node = sp_node;
-	strcpy(sp_node->private_group_name, GC_DATA(gcsi)->private_group_name);
-	sp_node->id = id;
-	sp_node->node_id = node->id;
-
-	if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
-	{
-		new_group->node_id_self_ref = node->id;
-	}
-				
-	gcsi_node_changed(new_group, node, GCVC_JOINED);
-				
-	gcsi_viewchange_stop(new_group);
+	elog(LOG, "GC Layer: joined group %s.", full_group_name);
 
 	return new_group;
 }
@@ -506,25 +478,66 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		if(Is_regular_mess(st))
 		{
 			id = pgn2id(&GC_DATA(gcsi)->sender);
-			Assert(GC_DATA(gcsi)->num_groups >= 1);
-			if(strcmp(GC_DATA(gcsi)->target_groups[0], 
-			          GC_DATA(gcsi)->private_group_name) == 0)
-			{
-				/* since match the private_group_name, it is from unicast */
-				group = gc_get_group(gcsi, GC_DATA(gcsi)->group_name);
-				Assert(group);
-				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
-				Assert(node);
-				coordinator_handle_gc_message(group, node, 'F', b);
-			}
-			else
-			{
-				/* we assume msgs are sent to only one group currently */
-				group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[0]);
-				Assert(group);
+			group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+			if(group) {
+				/* liyu: group msg will have the group name as sender,
+				 * so if there is that group, implicate that this is a
+				 * group msg. This should be the usual case. */
 				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
 				Assert(node);
 				coordinator_handle_gc_message(group, node, 'T', b);
+			}
+			else {
+				/* liyu: otherwise this could be a unicast msg. We
+				 * should be able to find this node's private group
+				 * name in target_groups */
+				j = -1;
+				for(i=0; i<GC_DATA(gcsi)->num_groups; ++i)
+				{
+					if(strcmp(GC_DATA(gcsi)->target_groups[i],
+					          GC_DATA(gcsi)->private_group_name) == 0)
+					{
+						j = i;
+						break;
+					}
+				}
+
+				if(j > 0)
+				{
+					/* so this is a unicast msg. The group should also in target groups */
+					group = NULL;
+					for(i=0; i<GC_DATA(gcsi)->num_groups; ++i)
+					{
+						group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[i]);
+						if(group)
+						{
+							/* find the first group have it should be
+							 * enough, since everyone should have both
+							 * the nodes */
+							break;
+						}
+					}
+
+					if(group)
+					{
+						node = hash_search(group->nodes, &id, HASH_FIND, NULL);
+						Assert(node);
+						coordinator_handle_gc_message(group, node, 'F', b);
+					}
+					else
+					{
+						elog(ERROR, "GC Layer: %s and %s sent each other msg but within NOGROUP!",
+						     GC_DATA(gcsi)->private_group_name,
+						     GC_DATA(gcsi)->sender);
+					}
+				}
+				else
+				{
+					/* still no lucky. So this must be msg to the wrong place */
+					elog(WARNING, "GC Layer: %s got a wrong msg from %s (which does send to i,.)",
+					     GC_DATA(gcsi)->private_group_name,
+					     GC_DATA(gcsi)->sender);
+				}
 			}
 		}
 		else if(Is_membership_mess(st))
@@ -575,8 +588,10 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 				
 					gcsi_viewchange_stop(group);
 
+					/*
 					hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
 					Assert(found);
+					*/
 
 					elog(LOG, "GC Layer: node %s joined group %s.",
 					     memb_info.changed_member, GC_DATA(gcsi)->sender);
@@ -746,6 +761,44 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			   2.  otherwise, do not report ERROR...
 			*/
 			elog(WARNING, "GC Layer: unknown message type 0x%x received.", st);
+			if(GC_DATA(gcsi)->sender)
+				elog(WARNING, "GC Layer:   ==> from %s", GC_DATA(gcsi)->sender);
+
+			group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
+			if(!group)
+			{
+				/* This should be a knock-knock msg from spread by
+				 * joining but result in creating new group
+				 */
+				gcsi_viewchange_start(group);
+
+				id = pgn2id(GC_DATA(gcsi)->private_group_name);
+				sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
+				Assert(!found);
+				RESET_SPREAD_NODE(sp_node);
+				node = gcsi_add_node(group, id);
+				node->gcs_node = sp_node;
+				strcpy(sp_node->private_group_name, GC_DATA(gcsi)->private_group_name);
+				sp_node->id = id;
+				sp_node->node_id = node->id;
+
+				if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
+				{
+					group->node_id_self_ref = node->id;
+				}
+				
+				gcsi_node_changed(group, node, GCVC_JOINED);
+				
+				gcsi_viewchange_stop(group);
+
+				/*
+				sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
+				Assert(found);
+				*/
+
+				elog(LOG, "GC Layer: Got knock-knock, added self to new group %s",
+				     GC_DATA(gcsi)->sender);
+			}
 		}
 
 		GC_DATA(gcsi)->recv_flag = false;
