@@ -65,13 +65,21 @@ typedef struct
 
 typedef struct
 {
-	char private_group_name[MAX_GROUP_NAME];
-
-	/* each node_id, calculated based on private_group_name */
+	/* liyu: The order of id, node_id is vital, because spread_node
+	 * will be hashed in HTAB. Currently PostgreSQL's dynamic hash (as
+	 * well as normal hash) requires the hash key to be strictly the
+	 * first element in node memory layout. This is the same in table
+	 * staff.
+	 */
+	/* Key for hash: calculated based on private_group_name */
 	uint32      id;
+
+	/* other fields go below */
 
 	/* the coordinator node_id */
 	uint32		node_id;
+
+	char private_group_name[MAX_GROUP_NAME];
 } spread_node;
 
 #define RESET_GCSI_NAMES(x) \
