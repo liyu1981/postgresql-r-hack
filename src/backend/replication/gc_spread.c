@@ -5,6 +5,7 @@
  *	  An async interface to the spread toolkit, a group communication
  *    system developed by Spread Concepts LLC.
  *
+ * Copyright (c) 2010, Yu Li(li.yu@emc.com)
  * Copyright (c) 2003-2010, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
@@ -35,23 +36,14 @@
 #define MAX_MEMBERS      100
 #define MAX_VSSETS       100
 
-typedef enum
-{
-	SPS_INITIALIZING = 0,
-	SPS_AUTHENTICATING = 1,
-	SPS_READY = 12
-} spread_state;
-
 typedef struct
 {
 	char    spread_name[MAX_GROUP_NAME];
 	mailbox mbox;
 	char    private_group_name[MAX_GROUP_NAME];
 
-	spread_state state;
-
-	bool   recv_flag;
 	/* receive related stuff */
+	bool   recv_flag;
 	buffer recv_buffer;
 	char   sender[MAX_GROUP_NAME];
 	char   target_groups[MAX_MEMBERS][MAX_GROUP_NAME];
@@ -168,52 +160,56 @@ spread_recv(gcs_info *gcsi)
 
 	GC_DATA(gcsi)->recv_flag = false;
 
-	err = SP_poll(GC_DATA(gcsi)->mbox);
-	if(err > 0)
+	/* liyu: Do not use SP_poll before SP_receive, because SP_poll
+	 * will corrupt the msg which send to SP_receive to
+	 * SP_receive. The documentation of spread claim that this is not
+	 * a problem, but actually it happens! I do not know why
+	 * either.
+
+	 * The internal of spread on SP_poll uses ioctl with
+	 * FIONREAD to get the number of bytes in the head of next
+	 * msg. That should not corrupt the msg ... or ... spread itself
+	 * actually forget attach a lenght before each of its msg ? Still
+	 * not very sure. :(
+	 */
+	/* err = SP_poll(GC_DATA(gcsi)->mbox); */
+
+	RESET_GCSI_RECV(gcsi);
+
+	err = SP_receive(GC_DATA(gcsi)->mbox,
+	                 &GC_DATA(gcsi)->service_type,
+	                 GC_DATA(gcsi)->sender,
+	                 MAX_MEMBERS,
+	                 &GC_DATA(gcsi)->num_groups,
+	                 GC_DATA(gcsi)->target_groups,
+	                 &GC_DATA(gcsi)->mess_type,
+	                 &GC_DATA(gcsi)->endian_mismatch,
+	                 RECV_BUFFER_SIZE,
+	                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
+
+	/* first try to receive it again */
+	if(err < 0)
 	{
-		RESET_GCSI_RECV(gcsi);
-
-		err = SP_receive(GC_DATA(gcsi)->mbox,
-		                 &GC_DATA(gcsi)->service_type,
-		                 GC_DATA(gcsi)->sender,
-		                 MAX_MEMBERS,
-		                 &GC_DATA(gcsi)->num_groups,
-		                 GC_DATA(gcsi)->target_groups,
-		                 &GC_DATA(gcsi)->mess_type,
-		                 &GC_DATA(gcsi)->endian_mismatch,
-		                 RECV_BUFFER_SIZE,
-		                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
-
-		/* first try to receive it again */
-		if(err < 0)
+		if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
 		{
-			if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
-			{
-				/* liyu: the msg is too big to be hold, must have
-				 * someone not follow the protocol. no other
-				 * solutions, panic T_T.
-				 */
-				elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
-				     GC_DATA(gcsi)->private_group_name);
-			}
-			else
-			{
-				elog(ERROR, "GC Layer: error %d while %s receive msg.",
-				     err, GC_DATA(gcsi)->private_group_name);
-			}
+			/* liyu: the msg is too big to be hold, must have
+			 * someone not follow the protocol. no other
+			 * solutions, panic T_T.
+			 */
+			elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
+			     GC_DATA(gcsi)->private_group_name);
 		}
 		else
 		{
-			elog(DEBUG3, "GC Layer: %s received %d bytes.",
-			     GC_DATA(gcsi)->private_group_name, err);
-			GC_DATA(gcsi)->recv_flag = true;
+			elog(ERROR, "GC Layer: error %d while %s receive msg.",
+			     err, GC_DATA(gcsi)->private_group_name);
 		}
 	}
 	else
 	{
-		/* no message waiting or error occured, just return */
-		elog(DEBUG4, "GC Layer: no msg currently.");
-		return;
+		elog(DEBUG3, "GC Layer: %s received %d bytes.",
+		     GC_DATA(gcsi)->private_group_name, err);
+		GC_DATA(gcsi)->recv_flag = true;
 	}
 }
 
@@ -226,9 +222,6 @@ spread_connect(gcs_info *gcsi)
 	Assert(gcsi->conn_state == GCSCS_DOWN);
 
 	elog(DEBUG3, "GC Layer: connecting to the spread daemon");
-
-	/* set correct state */
-	GC_DATA(gcsi)->state = SPS_INITIALIZING;
 
 	err = SP_connect(GC_DATA(gcsi)->spread_name,         
                      /* spread_name: local daemon @ 4803 will be connected */ 
@@ -763,42 +756,6 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			elog(WARNING, "GC Layer: unknown message type 0x%x received.", st);
 			if(GC_DATA(gcsi)->sender)
 				elog(WARNING, "GC Layer:   ==> from %s", GC_DATA(gcsi)->sender);
-
-			group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
-			if(!group)
-			{
-				/* This should be a knock-knock msg from spread by
-				 * joining but result in creating new group
-				 */
-				gcsi_viewchange_start(group);
-
-				id = pgn2id(GC_DATA(gcsi)->private_group_name);
-				sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
-				Assert(!found);
-				RESET_SPREAD_NODE(sp_node);
-				node = gcsi_add_node(group, id);
-				node->gcs_node = sp_node;
-				strcpy(sp_node->private_group_name, GC_DATA(gcsi)->private_group_name);
-				sp_node->id = id;
-				sp_node->node_id = node->id;
-
-				if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
-				{
-					group->node_id_self_ref = node->id;
-				}
-				
-				gcsi_node_changed(group, node, GCVC_JOINED);
-				
-				gcsi_viewchange_stop(group);
-
-				/*
-				sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
-				Assert(found);
-				*/
-
-				elog(LOG, "GC Layer: Got knock-knock, added self to new group %s",
-				     GC_DATA(gcsi)->sender);
-			}
 		}
 
 		GC_DATA(gcsi)->recv_flag = false;
