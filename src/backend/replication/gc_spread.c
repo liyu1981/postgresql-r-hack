@@ -79,7 +79,7 @@ typedef struct
 #define RESET_GCSI_RECV(x)	  \
 	memset(GC_DATA((x))->sender, 0, MAX_GROUP_NAME); \
 	memset(GC_DATA((x))->target_groups, 0, MAX_GROUP_NAME*MAX_MEMBERS); \
-	memset(GC_DATA((x))->members, 0, MAX_GROUP_NAME*MAX_MEMBERS)
+	memset(GC_DATA((x))->members, 0, MAX_GROUP_NAME*MAX_MEMBERS)	
 
 #define RESET_SPREAD_NODE(x) \
 	memset((x)->private_group_name, 0, MAX_GROUP_NAME)
@@ -209,6 +209,8 @@ spread_recv(gcs_info *gcsi)
 	{
 		elog(DEBUG3, "GC Layer: %s received %d bytes.",
 		     GC_DATA(gcsi)->private_group_name, err);
+		GC_DATA(gcsi)->recv_buffer.ptr = 0;
+		GC_DATA(gcsi)->recv_buffer.fill_size = err;
 		GC_DATA(gcsi)->recv_flag = true;
 	}
 }
@@ -438,7 +440,7 @@ void
 spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 {
 	int              err;
-	service          st = GC_DATA(gcsi)->service_type;
+	service          st;
 	gcs_group       *group;
 	spread_node     *sp_node;
 	group_node      *node;
@@ -459,7 +461,6 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	Assert(GC_DATA(gcsi)->recv_flag == false);
 
 	spread_recv(gcsi);
-
 	if(!(GC_DATA(gcsi)->recv_flag))
 	{
 		/* no msg, do nothing and return */
@@ -468,69 +469,48 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	}
 	else
 	{
+		st = GC_DATA(gcsi)->service_type;
 		if(Is_regular_mess(st))
 		{
 			id = pgn2id(&GC_DATA(gcsi)->sender);
-			group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
-			if(group) {
-				/* liyu: group msg will have the group name as sender,
-				 * so if there is that group, implicate that this is a
-				 * group msg. This should be the usual case. */
-				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
-				Assert(node);
-				coordinator_handle_gc_message(group, node, 'T', b);
-			}
-			else {
-				/* liyu: otherwise this could be a unicast msg. We
-				 * should be able to find this node's private group
-				 * name in target_groups */
-				j = -1;
+			if(GC_DATA(gcsi)->sender[0] == '#')
+			{
+				/* unicast msg will have a private group name as
+				 * sender, which starts with '#' */
+				group = NULL;
 				for(i=0; i<GC_DATA(gcsi)->num_groups; ++i)
 				{
-					if(strcmp(GC_DATA(gcsi)->target_groups[i],
-					          GC_DATA(gcsi)->private_group_name) == 0)
+					group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[i]);
+					if(group)
 					{
-						j = i;
+						/* find the first group have it should be
+						 * enough, since everyone should have both
+						 * the nodes */
 						break;
 					}
 				}
 
-				if(j > 0)
+				if(group)
 				{
-					/* so this is a unicast msg. The group should also in target groups */
-					group = NULL;
-					for(i=0; i<GC_DATA(gcsi)->num_groups; ++i)
-					{
-						group = gc_get_group(gcsi, GC_DATA(gcsi)->target_groups[i]);
-						if(group)
-						{
-							/* find the first group have it should be
-							 * enough, since everyone should have both
-							 * the nodes */
-							break;
-						}
-					}
-
-					if(group)
-					{
-						node = hash_search(group->nodes, &id, HASH_FIND, NULL);
-						Assert(node);
-						coordinator_handle_gc_message(group, node, 'F', b);
-					}
-					else
-					{
-						elog(ERROR, "GC Layer: %s and %s sent each other msg but within NOGROUP!",
-						     GC_DATA(gcsi)->private_group_name,
-						     GC_DATA(gcsi)->sender);
-					}
+					node = hash_search(group->nodes, &id, HASH_FIND, NULL);
+					Assert(node);
+					coordinator_handle_gc_message(group, node, 'F', b);
 				}
 				else
 				{
-					/* still no lucky. So this must be msg to the wrong place */
-					elog(WARNING, "GC Layer: %s got a wrong msg from %s (which does send to i,.)",
+					elog(ERROR, "GC Layer: %s and %s sent each other msg but within NOGROUP!",
 					     GC_DATA(gcsi)->private_group_name,
 					     GC_DATA(gcsi)->sender);
 				}
+			}
+			else
+			{
+				/* group msg will have the group name as sender, so
+				 * remember not to use any group name with '#' as the
+				 * first character */
+				node = hash_search(group->nodes, &id, HASH_FIND, NULL);
+				Assert(node);
+				coordinator_handle_gc_message(group, node, 'T', b);
 			}
 		}
 		else if(Is_membership_mess(st))
