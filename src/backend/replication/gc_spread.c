@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <pthread.h>
+
 #include "postgres.h"
 #include "storage/buffer.h"
 
@@ -38,9 +40,12 @@
 
 typedef struct
 {
-	char    spread_name[MAX_GROUP_NAME];
-	mailbox mbox;
-	char    private_group_name[MAX_GROUP_NAME];
+	char            spread_name[MAX_GROUP_NAME];
+	mailbox         mbox;
+	char            private_group_name[MAX_GROUP_NAME];
+	pthread_t       recv_thread;
+	pthread_cond_t  recv_thread_cond;
+	pthread_mutex_t recv_thread_mutex; /* currently not used */
 
 	/* receive related stuff */
 	bool   recv_flag;
@@ -102,6 +107,7 @@ void spread_broadcast(const gcs_group *group, const void *data,
 void spread_unicast(const gcs_group *group, const group_node *node,
 					const void *data, int size);
 
+void spread_recv_thread(void *ptr);
 
 uint32 
 pgn2id(const char *name)
@@ -128,13 +134,26 @@ pgn2id(const char *name)
 void
 spread_init(gcs_info *gcsi, char **params)
 {
+	if(gcsi->data)
+	{
+		if(&GC_DATA(gcsi)->recv_buffer)
+			pfree(&GC_DATA(gcsi)->recv_buffer);
+		if(GC_DATA(gcsi)->recv_thread)
+		{
+			/* force the thread to terminate */
+			pthread_kill(GC_DATA(gcsi)->recv_thread, 9);
+			pthread_mutex_destroy(&GC_DATA(gcsi)->recv_thread_mutex);
+			pthread_cond_destroy(&GC_DATA(gcsi)->recv_thread_cond);
+		}
+		pfree(gcsi->data);
+	}
+
 	gcsi->data = palloc(sizeof(spread_data));
 	init_buffer(&GC_DATA(gcsi)->recv_buffer, palloc(RECV_BUFFER_SIZE),
 	            RECV_BUFFER_SIZE);
-	/* should be really carefull, since stupid spread will not attach
-	 * '\0' for the group name */
 	RESET_GCSI_NAMES(gcsi);
 	GC_DATA(gcsi)->recv_flag = false; /* init the recv flag */
+	GC_DATA(gcsi)->recv_thread = NULL;
 
 	gc_init_groups_hash(gcsi);
 
@@ -156,62 +175,77 @@ spread_init(gcs_info *gcsi, char **params)
 void
 spread_recv(gcs_info *gcsi)
 {
-	int     err;
+	/* this is moved to spread_recv_thread, so do nothing here */
+}
 
-	GC_DATA(gcsi)->recv_flag = false;
+void
+spread_recv_thread(void *ptr)
+{
+	int       err;
+	gcs_info *gcsi = (gcs_info*)ptr;
 
-	/* liyu: Do not use SP_poll before SP_receive, because SP_poll
-	 * will corrupt the msg which send to SP_receive to
-	 * SP_receive. The documentation of spread claim that this is not
-	 * a problem, but actually it happens! I do not know why
-	 * either.
-
-	 * The internal of spread on SP_poll uses ioctl with
-	 * FIONREAD to get the number of bytes in the head of next
-	 * msg. That should not corrupt the msg ... or ... spread itself
-	 * actually forget attach a lenght before each of its msg ? Still
-	 * not very sure. :(
-	 */
-	/* err = SP_poll(GC_DATA(gcsi)->mbox); */
-
-	RESET_GCSI_RECV(gcsi);
-
-	err = SP_receive(GC_DATA(gcsi)->mbox,
-	                 &GC_DATA(gcsi)->service_type,
-	                 GC_DATA(gcsi)->sender,
-	                 MAX_MEMBERS,
-	                 &GC_DATA(gcsi)->num_groups,
-	                 GC_DATA(gcsi)->target_groups,
-	                 &GC_DATA(gcsi)->mess_type,
-	                 &GC_DATA(gcsi)->endian_mismatch,
-	                 RECV_BUFFER_SIZE,
-	                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
-
-	/* first try to receive it again */
-	if(err < 0)
+	for(;;) 
 	{
-		if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
+		/* loop & sleep until the previous msg is handled */
+		if(GC_DATA(gcsi)->recv_flag == true)
+			pthread_cond_wait(&GC_DATA(gcsi)->recv_thread_cond,
+			                  &GC_DATA(gcsi)->recv_thread_mutex);
+
+		Assert(GC_DATA(gcsi)->recv_flag == false);
+
+		/* liyu: Do not use SP_poll before SP_receive, because SP_poll
+		 * will corrupt the msg which send to SP_receive to
+		 * SP_receive. The documentation of spread claim that this is not
+		 * a problem, but actually it happens! I do not know why
+		 * either.
+
+		 * The internal of spread on SP_poll uses ioctl with
+		 * FIONREAD to get the number of bytes in the head of next
+		 * msg. That should not corrupt the msg ... or ... spread itself
+		 * actually forget attach a lenght before each of its msg ? Still
+		 * not very sure. :(
+		 */
+		/* err = SP_poll(GC_DATA(gcsi)->mbox); */
+
+		RESET_GCSI_RECV(gcsi);
+
+		err = SP_receive(GC_DATA(gcsi)->mbox,
+		                 &GC_DATA(gcsi)->service_type,
+		                 GC_DATA(gcsi)->sender,
+		                 MAX_MEMBERS,
+		                 &GC_DATA(gcsi)->num_groups,
+		                 GC_DATA(gcsi)->target_groups,
+		                 &GC_DATA(gcsi)->mess_type,
+		                 &GC_DATA(gcsi)->endian_mismatch,
+		                 RECV_BUFFER_SIZE,
+		                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
+
+		/* first try to receive it again */
+		if(err < 0)
 		{
-			/* liyu: the msg is too big to be hold, must have
-			 * someone not follow the protocol. no other
-			 * solutions, panic T_T.
-			 */
-			elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
-			     GC_DATA(gcsi)->private_group_name);
+			if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
+			{
+				/* liyu: the msg is too big to be hold, must have
+				 * someone not follow the protocol. no other
+				 * solutions, panic T_T.
+				 */
+				elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
+				     GC_DATA(gcsi)->private_group_name);
+			}
+			else
+			{
+				elog(ERROR, "GC Layer: error %d while %s receive msg.",
+				     err, GC_DATA(gcsi)->private_group_name);
+			}
 		}
 		else
 		{
-			elog(ERROR, "GC Layer: error %d while %s receive msg.",
-			     err, GC_DATA(gcsi)->private_group_name);
+			elog(DEBUG3, "GC Layer: %s received %d bytes.",
+			     GC_DATA(gcsi)->private_group_name, err);
+			GC_DATA(gcsi)->recv_buffer.ptr = 0;
+			GC_DATA(gcsi)->recv_buffer.fill_size = err;
+			GC_DATA(gcsi)->recv_flag = true;
 		}
-	}
-	else
-	{
-		elog(DEBUG3, "GC Layer: %s received %d bytes.",
-		     GC_DATA(gcsi)->private_group_name, err);
-		GC_DATA(gcsi)->recv_buffer.ptr = 0;
-		GC_DATA(gcsi)->recv_buffer.fill_size = err;
-		GC_DATA(gcsi)->recv_flag = true;
 	}
 }
 
@@ -244,6 +278,15 @@ spread_connect(gcs_info *gcsi)
 		         GC_DATA(gcsi)->spread_name,
 		         GC_DATA(gcsi)->private_group_name);
 		    gcsi_gcs_ready(gcsi);
+
+		    /* connected, so start the recv thread */
+		    pthread_mutex_init(&GC_DATA(gcsi)->recv_thread_mutex, NULL);
+		    pthread_cond_init(&GC_DATA(gcsi)->recv_thread_cond, NULL);
+		    pthread_create(&(GC_DATA(gcsi)->recv_thread),
+		                   NULL,
+		                   spread_recv_thread,
+		                   (void*)gcsi);
+
 		    break;
 	    case ILLEGAL_SPREAD:
 		    elog(ERROR, "GC Layer: connect error - illegal spread.");
@@ -458,16 +501,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	spread_data *sp_data = GC_DATA(gcsi);
 //#endif
 
-	Assert(GC_DATA(gcsi)->recv_flag == false);
-
-	spread_recv(gcsi);
-	if(!(GC_DATA(gcsi)->recv_flag))
-	{
-		/* no msg, do nothing and return */
-		Assert(GC_DATA(gcsi)->recv_flag == false);
-		return;
-	}
-	else
+	if((GC_DATA(gcsi)->recv_flag))
 	{
 		st = GC_DATA(gcsi)->service_type;
 		if(Is_regular_mess(st))
@@ -739,6 +773,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		}
 
 		GC_DATA(gcsi)->recv_flag = false;
+		pthread_cond_signal(&GC_DATA(gcsi)->recv_thread_cond);
 	}
 }
 

@@ -1007,6 +1007,8 @@ coordinator_replication_init(void)
 	gcsi = palloc0(sizeof(gcs_info));
 	gcsi->connection_tries = 0;
 	gcsi->conn_state = GCSCS_DOWN;
+	/* init the data to be NULL, since we need it in spread_init */
+	gcsi->data = NULL;
 
 
 	/* initialize the coordinator's private transaction info hash */

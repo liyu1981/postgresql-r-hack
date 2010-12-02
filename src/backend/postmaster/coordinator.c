@@ -842,8 +842,8 @@ CoordinatorMain(int argc, char *argv[])
 		coordinator_determine_sleep(can_launch, false, &nap);
 
 		/* Initialize variables for listening on sockets */ 
-		FD_ZERO(&socks);
-		max_sock_id = 0;
+		/* FD_ZERO(&socks); */
+		/* max_sock_id = 0; */
 		socket_ready = false;
 
 #ifdef REPLICATION
@@ -880,11 +880,11 @@ CoordinatorMain(int argc, char *argv[])
 		 *        method.
 		 */
 
-		sigemptyset(&sigmask);
-		sigaddset(&sigmask, SIGINT);
-		sigaddset(&sigmask, SIGHUP);
-		sigaddset(&sigmask, SIGUSR2);
-		sigprocmask(SIG_BLOCK, &sigmask, &oldmask);
+		/* sigemptyset(&sigmask); */
+		/* sigaddset(&sigmask, SIGINT); */
+		/* sigaddset(&sigmask, SIGHUP); */
+		/* sigaddset(&sigmask, SIGUSR2); */
+		/* sigprocmask(SIG_BLOCK, &sigmask, &oldmask); */
 
 		/* FIX ME: dirtly hack, just comment out checking socket since
 		 * spread does not use it */
@@ -909,7 +909,7 @@ CoordinatorMain(int argc, char *argv[])
 		/* 		socket_ready = true; */
 		/* } */
 
-		sigprocmask(SIG_SETMASK, &oldmask, NULL);
+		/* sigprocmask(SIG_SETMASK, &oldmask, NULL); */
 
 		/*
 		 * Emergency bailout if postmaster has died.  This is to avoid the
