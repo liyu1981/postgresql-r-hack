@@ -1319,7 +1319,8 @@ coordinator_check_group_state(gcs_group *group)
 
 	if (group->last_vc_join_pending)
 	{
-		Assert(group->db_state == RDBS_JOIN_REQUESTED);
+		if(group->dboid != TemplateDbOid)
+			Assert(group->db_state == RDBS_JOIN_REQUESTED);
 
 		if (group->dboid != TemplateDbOid)
 			Assert(replication_group->db_state == RDBS_OPERATING);
