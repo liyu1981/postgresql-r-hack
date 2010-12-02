@@ -90,7 +90,6 @@ typedef struct
 	memset((x)->private_group_name, 0, MAX_GROUP_NAME)
 
 /* prototypes */
-uint32 pgn2id(const char *name);
 
 void spread_recv(gcs_info *gcsi);
 void spread_connect(gcs_info *gcsi);
@@ -107,7 +106,18 @@ void spread_broadcast(const gcs_group *group, const void *data,
 void spread_unicast(const gcs_group *group, const group_node *node,
 					const void *data, int size);
 
+/* private methods */
+uint32 pgn2id(const char *name);
 void spread_recv_thread(void *ptr);
+void spread_group_check_members(const gcs_info *gcsi,
+                                gcs_group *group,
+                                int memb_size, char memb_names[][MAX_GROUP_NAME]);
+void spread_group_join_node(const gcs_info *gcsi,
+                            gcs_group *group,
+                            const char *node_name);
+void spread_group_leave_node(const gcs_info *gcsi,
+                             gcs_group *group,
+                             const char *node_name);
 
 uint32 
 pgn2id(const char *name)
@@ -485,7 +495,6 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	int              err;
 	service          st;
 	gcs_group       *group;
-	spread_node     *sp_node;
 	group_node      *node;
 	vs_set_info      vssets[MAX_VSSETS];
 	membership_info  memb_info;
@@ -493,8 +502,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	unsigned int     my_vsset_index;
 	char             members[MAX_MEMBERS][MAX_GROUP_NAME];
 	buffer          *b  = &(GC_DATA(gcsi)->recv_buffer);
-	int              i,j;
-	bool             found;
+	int              i;
 	int              id;
 
 //#ifdef DEBUG
@@ -562,37 +570,10 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
-
-					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
-					if(found)
-					{
-						elog(DEBUG3, "GC Layer: node %s already in group %s.",
-						     memb_info.changed_member, GC_DATA(gcsi)->sender);
-						node = gcsi_get_node(group, sp_node->node_id);
-						Assert(node);
-					}
-					else
-					{
-						/*
-						 * we have just added a new node, tell the
-						 * coordinator, too.
-						 */
-						RESET_SPREAD_NODE(sp_node);
-						node = gcsi_add_node(group, id);
-						node->gcs_node = sp_node;
-						strcpy(sp_node->private_group_name, memb_info.changed_member);
-						sp_node->id = id;
-						sp_node->node_id = node->id;
-
-						if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
-						{
-							group->node_id_self_ref = node->id;
-						}
-					}
-				
-					gcsi_node_changed(group, node, GCVC_JOINED);
-				
+					spread_group_check_members(gcsi,
+					                           group,
+					                           GC_DATA(gcsi)->num_groups,
+					                           GC_DATA(gcsi)->target_groups);
 					gcsi_viewchange_stop(group);
 
 					/*
@@ -608,16 +589,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
-
-					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
-					if(found)
-					{
-						node = gcsi_get_node(group, sp_node->node_id);
-						Assert(node);
-						gcsi_node_changed(group, node, GCVC_LEFT);
-					}
-
+					spread_group_leave_node(gcsi,
+					                        group,
+					                        memb_info.changed_member);
 					gcsi_viewchange_stop(group);
 
 					elog(LOG, "GC Layer: node %s leave group %s.",
@@ -628,16 +602,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 					group = gc_get_group(gcsi, GC_DATA(gcsi)->sender);
 					Assert(group);
 					gcsi_viewchange_start(group);
-
-					id = pgn2id(memb_info.changed_member);
-					sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
-					if(found)
-					{
-						node = gcsi_get_node(group, sp_node->node_id);
-						Assert(node);
-						gcsi_node_changed(group, node, GCVC_LEFT);
-					}
-
+					spread_group_leave_node(gcsi,
+					                        group,
+					                        memb_info.changed_member);
 					gcsi_viewchange_stop(group);
 
 					elog(LOG, "GC Layer: node %s disconnect from group %s.",
@@ -683,12 +650,10 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 
 					for(i = 0; i < num_vs_sets; i++)
 					{
-						elog(LOG, "GC Layer: %s VS set %d has %u members:\n",
+						elog(DEBUG3, "GC Layer: %s VS set %d has %u members:\n",
 						     (i  == my_vsset_index) ?
 						     ("LOCAL") : ("OTHER"), i, vssets[i].num_members);
 
-						/* must reset, since stupid spread will not
-						 * attach '\0' for us */
 						memset(members, 0, MAX_MEMBERS*MAX_GROUP_NAME);
 
 						err = SP_get_vs_set_members(b->data, &vssets[i], members, MAX_MEMBERS);
@@ -699,22 +664,9 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 							     MAX_MEMBERS);
 						}
 
-						for(j = 0; j < vssets[i].num_members; j++)
-						{
-							id = pgn2id(members[j]);
-							sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
-							RESET_SPREAD_NODE(sp_node);
-							node = gcsi_add_node(group, id);
-							node->gcs_node = sp_node;
-							strcpy(sp_node->private_group_name, members[j]);
-							sp_node->id = id;
-							sp_node->node_id = node->id;
-
-							if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
-							{
-								group->node_id_self_ref = node->id;
-							}
-						}
+						spread_group_check_members(gcsi,
+						                           group,
+						                           vssets[i].num_members, members);
 					}
 
 					gcsi_viewchange_stop(group);
@@ -749,7 +701,7 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 			     GC_DATA(gcsi)->mess_type, 
 			     GC_DATA(gcsi)->endian_mismatch, 
 			     GC_DATA(gcsi)->num_groups, 
-			     b->data);
+			     (char*)(b->data));
 		}
 		else
 		{
@@ -783,4 +735,76 @@ spread_is_local(const gcs_group *group, const group_node *node)
 	int id = pgn2id(GC_NODE(node)->private_group_name);
 	group_node* n = hash_search(group->nodes, &id, HASH_FIND, NULL);
 	return n != NULL;
+}
+
+void 
+spread_group_check_members(const gcs_info *gcsi, 
+                           gcs_group *group,
+                           int memb_size, char memb_names[][MAX_GROUP_NAME])
+{
+	int              i;
+	int              id;
+	spread_node     *sp_node;
+	bool             found;
+
+	/* check for misssing ones */
+	for(i=0; i<memb_size; ++i)
+	{
+		found = false;
+		id = pgn2id(memb_names[i]);
+		sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
+		if(!found)
+			spread_group_join_node(gcsi, group, memb_names[i]);
+	}
+}
+
+void
+spread_group_join_node(const gcs_info *gcsi,
+                       gcs_group *group,
+                       const char *node_name)
+{
+	int          id;
+	group_node  *node;
+	spread_node *sp_node;
+	bool         found = false;
+
+	id = pgn2id(node_name);
+	sp_node = hash_search(group->gcs_nodes, &id, HASH_ENTER, &found);
+	/*
+	 * we have just added a new node, tell the
+	 * coordinator, too.
+	 */
+	RESET_SPREAD_NODE(sp_node);
+	node = gcsi_add_node(group, id);
+	node->gcs_node = sp_node;
+	strcpy(sp_node->private_group_name, node_name);
+	sp_node->id = id;
+	sp_node->node_id = node->id;
+
+	if(id == pgn2id(GC_DATA(gcsi)->private_group_name))
+	{
+		group->node_id_self_ref = node->id;
+	}
+	
+	gcsi_node_changed(group, node, GCVC_JOINED);
+}
+
+void
+spread_group_leave_node(const gcs_info *gcsi,
+                        gcs_group *group,
+                        const char *node_name)
+{
+	int          id;
+	group_node  *node;
+	spread_node *sp_node;
+	bool         found = false;
+
+	id = pgn2id(node_name);
+	sp_node = hash_search(group->gcs_nodes, &id, HASH_FIND, &found);
+	if(found)
+	{
+		node = gcsi_get_node(group, sp_node->node_id);
+		Assert(node);
+		gcsi_node_changed(group, node, GCVC_LEFT);
+	}
 }
