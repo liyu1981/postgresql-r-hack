@@ -733,8 +733,7 @@ bool
 spread_is_local(const gcs_group *group, const group_node *node)
 {
 	int id = pgn2id(GC_NODE(node)->private_group_name);
-	group_node* n = hash_search(group->nodes, &id, HASH_FIND, NULL);
-	return n != NULL;
+	return id == group->node_id_self_ref;
 }
 
 void 
