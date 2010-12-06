@@ -1155,6 +1155,22 @@ coordinator_check_seed_state()
 		else
 			Assert(false);
 	}
+	else if(!seed_mode)
+	{
+		/* liyu: may not seed, but must also join other database's groups */
+		/* FIXME: not any error checking here!! */
+
+		if ((replication_group->last_vc_join_pending &&
+		     replication_group->db_state == RDBS_JOIN_REQUESTED) ||
+		    replication_group->db_state == RDBS_RECOVERING_SCHEMA)
+		{
+            /* we handled the join, so reset that flag */
+			replication_group->last_vc_join_pending = false;
+
+			coordinator_state_change(replication_group, RDBS_OPERATING);
+			coordinator_join_database_groups();
+		}
+	}
 }
 
 void
@@ -1319,12 +1335,19 @@ coordinator_check_group_state(gcs_group *group)
 
 	if (group->last_vc_join_pending)
 	{
-		Assert(group->db_state == RDBS_JOIN_REQUESTED);
+		if(group->dboid != TemplateDbOid)
+			Assert(group->db_state == RDBS_JOIN_REQUESTED);
 
 		if (group->dboid != TemplateDbOid)
 			Assert(replication_group->db_state == RDBS_OPERATING);
 
-		new_db_state = (seed_mode ? RDBS_OPERATING : RDBS_RECOVERING_SCHEMA);
+		/* liyu: the recovering mode currerntly in postgres r seems
+		 * not work, so a dirty hack is to disable it. This will
+		 * require us to manually make sure that the databases are
+		 * consistent with each other.
+		 */
+		/* new_db_state = (seed_mode ? RDBS_OPERATING : RDBS_RECOVERING_SCHEMA); */
+		new_db_state = (seed_mode ? RDBS_OPERATING : RDBS_OPERATING);
 		coordinator_state_change(group, new_db_state);
 
 		/* mark the join event as handled */

@@ -1593,6 +1593,7 @@ StartBackgroundWorker(void)
 			break;
 #endif
 		default:
+			elog(LOG, "Replication Layer: forked background worker %d.", worker_pid);
 			return (int) worker_pid;
 	}
 
@@ -1808,6 +1809,19 @@ BackgroundWorkerMain(int argc, char *argv[])
 	Oid			dbid;
 	char		dbname[NAMEDATALEN];
 	bool		terminate_worker = false;
+
+    /* liyu: add some code for debuging child process */
+	while(1)
+	{
+		sleep(1);
+		FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
+		if(fp != NULL)
+		{
+			fclose(fp);
+			break;
+		}
+	}
+    /* liyu: */
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
