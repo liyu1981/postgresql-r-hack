@@ -40,12 +40,17 @@
 
 typedef struct
 {
-	char            spread_name[MAX_GROUP_NAME];
-	mailbox         mbox;
-	char            private_group_name[MAX_GROUP_NAME];
-	pthread_t       recv_thread;
-	pthread_cond_t  recv_thread_cond;
-	pthread_mutex_t recv_thread_mutex; /* currently not used */
+	char             spread_name[MAX_GROUP_NAME];
+	mailbox          mbox;
+	char             private_group_name[MAX_GROUP_NAME];
+	bool            *socket_ready_p; 
+                     /* socket_ready_p points back to socket_ready in
+                      * postmaster/coordinator.c:847, it is used to
+                      * wake the coordinator_handle_gc_message
+                      * there */
+	pthread_t        recv_thread;
+	pthread_cond_t   recv_thread_cond;
+	pthread_mutex_t  recv_thread_mutex; /* currently not used */
 
 	/* receive related stuff */
 	bool   recv_flag;
@@ -108,7 +113,7 @@ void spread_unicast(const gcs_group *group, const group_node *node,
 
 /* private methods */
 uint32 pgn2id(const char *name);
-void spread_recv_thread(void *ptr);
+void _spread_recv(mailbox mbox, int code, void *data);
 void spread_group_check_members(const gcs_info *gcsi,
                                 gcs_group *group,
                                 int memb_size, char memb_names[][MAX_GROUP_NAME]);
@@ -189,74 +194,67 @@ spread_recv(gcs_info *gcsi)
 }
 
 void
-spread_recv_thread(void *ptr)
+_spread_recv(mailbox mbox, int code, void *data)
 {
 	int       err;
-	gcs_info *gcsi = (gcs_info*)ptr;
+	gcs_info *gcsi = (gcs_info*)data;
 
-	for(;;) 
-	{
-		/* loop & sleep until the previous msg is handled */
-		if(GC_DATA(gcsi)->recv_flag == true)
-			pthread_cond_wait(&GC_DATA(gcsi)->recv_thread_cond,
-			                  &GC_DATA(gcsi)->recv_thread_mutex);
+	Assert(!*(GC_DATA(gcsi)->socket_ready_p));
 
-		Assert(GC_DATA(gcsi)->recv_flag == false);
+    /* liyu: Do not use SP_poll before SP_receive, because SP_poll
+     * will corrupt the msg which send to SP_receive to
+     * SP_receive. The documentation of spread claim that this is not
+     * a problem, but actually it happens! I do not know why
+     * either.
 
-		/* liyu: Do not use SP_poll before SP_receive, because SP_poll
-		 * will corrupt the msg which send to SP_receive to
-		 * SP_receive. The documentation of spread claim that this is not
-		 * a problem, but actually it happens! I do not know why
-		 * either.
+     * The internal of spread on SP_poll uses ioctl with
+     * FIONREAD to get the number of bytes in the head of next
+     * msg. That should not corrupt the msg ... or ... spread itself
+     * actually forget attach a lenght before each of its msg ? Still
+     * not very sure. :(
+     */
+    /* err = SP_poll(GC_DATA(gcsi)->mbox); */
 
-		 * The internal of spread on SP_poll uses ioctl with
-		 * FIONREAD to get the number of bytes in the head of next
-		 * msg. That should not corrupt the msg ... or ... spread itself
-		 * actually forget attach a lenght before each of its msg ? Still
-		 * not very sure. :(
-		 */
-		/* err = SP_poll(GC_DATA(gcsi)->mbox); */
+    RESET_GCSI_RECV(gcsi);
 
-		RESET_GCSI_RECV(gcsi);
+    err = SP_receive(GC_DATA(gcsi)->mbox,
+                     &GC_DATA(gcsi)->service_type,
+                     GC_DATA(gcsi)->sender,
+                     MAX_MEMBERS,
+                     &GC_DATA(gcsi)->num_groups,
+                     GC_DATA(gcsi)->target_groups,
+                     &GC_DATA(gcsi)->mess_type,
+                     &GC_DATA(gcsi)->endian_mismatch,
+                     RECV_BUFFER_SIZE,
+                     (char *)(GC_DATA(gcsi)->recv_buffer.data));
 
-		err = SP_receive(GC_DATA(gcsi)->mbox,
-		                 &GC_DATA(gcsi)->service_type,
-		                 GC_DATA(gcsi)->sender,
-		                 MAX_MEMBERS,
-		                 &GC_DATA(gcsi)->num_groups,
-		                 GC_DATA(gcsi)->target_groups,
-		                 &GC_DATA(gcsi)->mess_type,
-		                 &GC_DATA(gcsi)->endian_mismatch,
-		                 RECV_BUFFER_SIZE,
-		                 (char *)(GC_DATA(gcsi)->recv_buffer.data));
-
-		/* first try to receive it again */
-		if(err < 0)
-		{
-			if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
-			{
-				/* liyu: the msg is too big to be hold, must have
-				 * someone not follow the protocol. no other
-				 * solutions, panic T_T.
-				 */
-				elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
-				     GC_DATA(gcsi)->private_group_name);
-			}
-			else
-			{
-				elog(ERROR, "GC Layer: error %d while %s receive msg.",
-				     err, GC_DATA(gcsi)->private_group_name);
-			}
-		}
-		else
-		{
-			elog(DEBUG3, "GC Layer: %s received %d bytes.",
-			     GC_DATA(gcsi)->private_group_name, err);
-			GC_DATA(gcsi)->recv_buffer.ptr = 0;
-			GC_DATA(gcsi)->recv_buffer.fill_size = err;
-			GC_DATA(gcsi)->recv_flag = true;
-		}
-	}
+    /* first try to receive it again */
+    if(err < 0)
+    {
+	    if(err == GROUPS_TOO_SHORT || err == BUFFER_TOO_SHORT)
+	    {
+		    /* liyu: the msg is too big to be hold, must have
+		     * someone not follow the protocol. no other
+		     * solutions, panic T_T.
+		     */
+		    elog(PANIC, "GC Layer: buffers or groups too short while %s receive msg.",
+		         GC_DATA(gcsi)->private_group_name);
+	    }
+	    else
+	    {
+		    elog(ERROR, "GC Layer: error %d while %s receive msg.",
+		         err, GC_DATA(gcsi)->private_group_name);
+	    }
+    }
+    else
+    {
+	    elog(DEBUG3, "GC Layer: %s received %d bytes.",
+	         GC_DATA(gcsi)->private_group_name, err);
+	    GC_DATA(gcsi)->recv_buffer.ptr = 0;
+	    GC_DATA(gcsi)->recv_buffer.fill_size = err;
+	    GC_DATA(gcsi)->recv_flag = true;
+	    *(GC_DATA(gcsi)->socket_ready_p) = true;
+    }
 }
 
 void
@@ -290,12 +288,14 @@ spread_connect(gcs_info *gcsi)
 		    gcsi_gcs_ready(gcsi);
 
 		    /* connected, so start the recv thread */
-		    pthread_mutex_init(&GC_DATA(gcsi)->recv_thread_mutex, NULL);
-		    pthread_cond_init(&GC_DATA(gcsi)->recv_thread_cond, NULL);
-		    pthread_create(&(GC_DATA(gcsi)->recv_thread),
-		                   NULL,
-		                   spread_recv_thread,
-		                   (void*)gcsi);
+		    /* pthread_mutex_init(&GC_DATA(gcsi)->recv_thread_mutex, NULL); */
+		    /* pthread_cond_init(&GC_DATA(gcsi)->recv_thread_cond, NULL); */
+		    /* pthread_create(&(GC_DATA(gcsi)->recv_thread), */
+		    /*                NULL, */
+		    /*                spread_recv_thread, */
+		    /*                (void*)gcsi); */
+		    E_init();
+		    E_attach_fd(GC_DATA(gcsi)->mbox, READ_FD, _spread_recv, 0, (void*)gcsi, HIGH_PRIORITY);
 
 		    break;
 	    case ILLEGAL_SPREAD:
@@ -487,6 +487,11 @@ void
 spread_set_socks(const gcs_info *gcsi, fd_set *socks, int *max_socks)
 {
 	/* spread does not use socks for communication, so nothing to do */
+	/* liyu: the address of socket_ready of postmaster/coordinator.c
+	 * will be passed in max_sock, so we can keep it here. This is a
+	 * dirty hack. */
+	GC_DATA(gcsi)->socket_ready_p = (bool*)max_socks;
+	*(GC_DATA(gcsi)->socket_ready_p) = false;
 }
 
 void
@@ -725,7 +730,8 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 		}
 
 		GC_DATA(gcsi)->recv_flag = false;
-		pthread_cond_signal(&GC_DATA(gcsi)->recv_thread_cond);
+		*(GC_DATA(gcsi)->socket_ready_p) = false;
+		/* pthread_cond_signal(&GC_DATA(gcsi)->recv_thread_cond); */
 	}
 }
 

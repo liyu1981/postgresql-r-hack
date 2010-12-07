@@ -64,6 +64,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sp.h>
+
 #include "access/heapam.h"
 #include "access/reloptions.h"
 #include "access/transam.h"
@@ -844,11 +846,11 @@ CoordinatorMain(int argc, char *argv[])
 		/* Initialize variables for listening on sockets */ 
 		/* FD_ZERO(&socks); */
 		/* max_sock_id = 0; */
-		socket_ready = false;
+		/* socket_ready = false; */
 
 #ifdef REPLICATION
 		/* FIX ME: spread does not use sockets, dirty hack currently */
-		/* coordinator_replication_reg_gcs(&socks, &max_sock_id); */
+		coordinator_replication_reg_gcs(NULL, &socket_ready);
 #endif
 
 #ifdef COORDINATOR_DEBUG
@@ -880,11 +882,11 @@ CoordinatorMain(int argc, char *argv[])
 		 *        method.
 		 */
 
-		/* sigemptyset(&sigmask); */
-		/* sigaddset(&sigmask, SIGINT); */
-		/* sigaddset(&sigmask, SIGHUP); */
-		/* sigaddset(&sigmask, SIGUSR2); */
-		/* sigprocmask(SIG_BLOCK, &sigmask, &oldmask); */
+		sigemptyset(&sigmask);
+		sigaddset(&sigmask, SIGINT);
+		sigaddset(&sigmask, SIGHUP);
+		sigaddset(&sigmask, SIGUSR2);
+		sigprocmask(SIG_BLOCK, &sigmask, &oldmask);
 
 		/* FIX ME: dirtly hack, just comment out checking socket since
 		 * spread does not use it */
@@ -893,12 +895,13 @@ CoordinatorMain(int argc, char *argv[])
 		 * events on the file descriptors with pselect(), if we've already
 		 * gotten a signal.
 		 */
-		/* if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP) */
-		/* { */
-		/* 	sigemptyset(&sigmask); */
+		if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP)
+		{
+			sigemptyset(&sigmask);
+			E_handle_events();
 		/* 	if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap, */
 		/* 				&sigmask) < 0) */
-		/* 	{	 */
+		/* 	{ */
 		/* 		if (errno != EINTR) */
 		/* 		{ */
 		/* 			elog(WARNING, "Coordinator: pselect failed: %m"); */
@@ -907,9 +910,9 @@ CoordinatorMain(int argc, char *argv[])
 		/* 	} */
 		/* 	else */
 		/* 		socket_ready = true; */
-		/* } */
+		}
 
-		/* sigprocmask(SIG_SETMASK, &oldmask, NULL); */
+		sigprocmask(SIG_SETMASK, &oldmask, NULL);
 
 		/*
 		 * Emergency bailout if postmaster has died.  This is to avoid the
@@ -982,13 +985,13 @@ CoordinatorMain(int argc, char *argv[])
 		 * should not be problem, since the spread_recv will do a
 		 * check. */
 		/* handle sockets with pending reads */
-		/* if (socket_ready) */
-		/* { */
+		if (socket_ready)
+		{
 #ifdef REPLICATION
-		if (replication_enabled)
-			coordinator_replication_check_sockets(&socks);
+			if (replication_enabled)
+				coordinator_replication_check_sockets(&socks);
 #endif
-		/* } */
+		}
 
 		/* handle pending imessages */
 		while ((msg = IMessageCheck()) != NULL)

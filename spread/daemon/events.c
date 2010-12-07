@@ -555,6 +555,7 @@ void 	E_handle_events(void)
 {
 static	int			Round_robin	= 0;
 static	const sp_time		long_timeout 	= { 10000,    0};
+                            /* liyu: 1w seconds? this is really bizzar! */
 static  const sp_time           zero_sec        = {     0,    0};
 #ifdef  BADCLOCK
 static	const sp_time		mili_sec 	= {     0, 1000};
