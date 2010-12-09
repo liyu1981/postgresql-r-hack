@@ -210,7 +210,7 @@ spread_recv_thread(void *ptr)
 			pthread_cond_wait(&GC_DATA(gcsi)->recv_thread_cond,
 			                  &GC_DATA(gcsi)->recv_thread_mutex);
 
-		Assert(GC_DATA(gcsi)->recv_flag == false);
+		/* Assert(GC_DATA(gcsi)->recv_flag == false); */
 
 		/* liyu: Do not use SP_poll before SP_receive, because SP_poll
 		 * will corrupt the msg which send to SP_receive to
