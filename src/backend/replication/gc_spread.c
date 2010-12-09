@@ -105,6 +105,11 @@ void spread_broadcast(const gcs_group *group, const void *data,
 					  int size, bool atomic);
 void spread_unicast(const gcs_group *group, const group_node *node,
 					const void *data, int size);
+group_node* spread_get_local_node(const gcs_group *group);
+
+#ifdef COORDINATOR_DEBUG
+void spread_get_node_desc(const gcs_group *group, group_node const *node, char *str);
+#endif
 
 /* private methods */
 uint32 pgn2id(const char *name);
@@ -178,6 +183,10 @@ spread_init(gcs_info *gcsi, char **params)
 	gcsi->funcs.is_local = &spread_is_local;
 	gcsi->funcs.broadcast = &spread_broadcast;
 	gcsi->funcs.unicast = &spread_unicast;
+	gcsi->funcs.get_local_node = &spread_get_local_node;
+#ifdef COORDINATOR_DEBUG
+	gcsi->funcs.get_node_desc = &spread_get_node_desc;
+#endif
 
 	strcpy(GC_DATA(gcsi)->spread_name, "4803");
 }
@@ -735,6 +744,28 @@ spread_is_local(const gcs_group *group, const group_node *node)
 	int id = pgn2id(GC_NODE(node)->private_group_name);
 	return id == group->node_id_self_ref;
 }
+
+group_node*
+spread_get_local_node(const gcs_group *group)
+{
+	Assert(group->gcsi->conn_state == GCSCS_ESTABLISHED);
+	int id = pgn2id(GC_DATA(group->gcsi)->private_group_name);
+	return gcsi_get_node(group, id);
+}
+
+#ifdef COORDINATOR_DEBUG
+void
+spread_get_node_desc(const gcs_group *group,
+                     group_node const *node,
+                     char *str)
+{
+	sprintf(str, "node %s(id:%d) of group %s(dboid:%d)",
+	        GC_NODE(node)->private_group_name,
+	        GC_NODE(node)->id,
+	        group->name,
+		    group->dboid);
+}
+#endif
 
 void 
 spread_group_check_members(const gcs_info *gcsi, 
