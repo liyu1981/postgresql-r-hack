@@ -253,8 +253,12 @@ spread_recv_thread(void *ptr)
 			}
 			else
 			{
-				elog(ERROR, "GC Layer: error %d while %s receive msg.",
-				     err, GC_DATA(gcsi)->private_group_name);
+				if(!coordinator_now_terminate)
+				{
+					/* only report error when coordinator not terminate itself */
+					elog(ERROR, "GC Layer: error %d while %s receive msg.",
+					     err, GC_DATA(gcsi)->private_group_name);
+				}
 			}
 		}
 		else

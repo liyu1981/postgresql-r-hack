@@ -149,6 +149,9 @@ MemoryContext DatabaseListCxt = NULL;
 WorkerInfo MyWorkerInfo = NULL;
 WorkerInfo terminatable_worker = NULL;
 
+/* liyu: add one global flag for spread */
+bool coordinator_now_terminate = false;
+
 #ifdef EXEC_BACKEND
 static pid_t coordinator_forkexec(void);
 static pid_t bgworker_forkexec(void);
@@ -922,7 +925,10 @@ CoordinatorMain(int argc, char *argv[])
 
 		/* the normal shutdown case */
 		if (got_SIGTERM)
+		{
+			coordinator_now_terminate = true;
 			break;
+		}
 
 		if (got_SIGHUP)
 		{

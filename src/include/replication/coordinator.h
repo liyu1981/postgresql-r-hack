@@ -29,6 +29,9 @@ typedef struct
 
 extern gcs_group *replication_group;
 
+/* liyu: add one global flag for spread */
+extern bool coordinator_now_terminate;
+
 extern void coordinator_replication_init(void);
 extern void coordinator_replication_reg_gcs(fd_set *socks, int *num_socks);
 extern void coordinator_replication_check_sockets(fd_set *socks);
