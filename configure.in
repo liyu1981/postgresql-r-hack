@@ -578,6 +578,12 @@ PGAC_ARG_BOOL(enable, replication, yes, [  --enable-replication    build in repl
 AC_MSG_RESULT([$enable_replication])
 AC_SUBST(enable_replication)
 
+AC_MSG_CHECKING([whether to build in coordinator debug support])
+PGAC_ARG_BOOL(enable, coordinatordebug, no, [  --enable-coordinatordebug    build in coordinator debug support],
+              [AC_DEFINE([COORDINATOR_DEBUG], 1, [Define to 1 to build with coordinator debug support. (--enable-coordinatordebug)])])
+AC_MSG_RESULT([$enable_coordinatordebug])
+AC_SUBST(enable_coordinatordebug)
+
 #
 # Optionally build Tcl modules (PL/Tcl)
 #

@@ -10,7 +10,7 @@ then
 fi
 
 # debug version
-./configure --prefix=/home/yli/TestCamp/postrep-dev --exec-prefix=/home/yli/TestCamp/postrep-dev --enable-debug --enable-cassert
+./configure --prefix=/home/yli/TestCamp/postrep-dev --exec-prefix=/home/yli/TestCamp/postrep-dev --enable-debug --enable-cassert --enable-coordinator-debug
 #release version
 # ./configure --prefix=/home/yli/TestCamp/postrep-dev --exec-prefix=/home/yli/TestCamp/postrep-dev
 
