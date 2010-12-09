@@ -1238,13 +1238,6 @@ ExecProcessTuple(IStreamReader reader, EState *estate, CsetStmtInfo *csi)
 	slot.tts_shouldFree = FALSE;
 	slot.tts_shouldFreeMin = FALSE;
 
-	/*
-	 * shortcuts to access data in the changeset
-	 */
-	idx_info = csi->rr_info->ri_IndexRelationInfo[csi->rr_info->ri_PrimaryKey];
-	idx_rel = csi->rr_info->ri_IndexRelationDescs[csi->rr_info->ri_PrimaryKey];
-	numKeys = idx_info->ii_NumIndexAttrs;
-
 	values = (Datum *) palloc(csi->tdesc->natts * sizeof(Datum));
 	nulls = (char *) palloc(csi->tdesc->natts * sizeof(bool));
 
@@ -1263,6 +1256,14 @@ ExecProcessTuple(IStreamReader reader, EState *estate, CsetStmtInfo *csi)
 		 */
 		if (csi->type == CSCMD_UPDATE || csi->type == CSCMD_DELETE)
 		{
+			/* liyu: move below shortcuts from outside to here */
+			/*
+			 * shortcuts to access data in the changeset
+			 */
+			idx_info = csi->rr_info->ri_IndexRelationInfo[csi->rr_info->ri_PrimaryKey];
+			idx_rel = csi->rr_info->ri_IndexRelationDescs[csi->rr_info->ri_PrimaryKey];
+			numKeys = idx_info->ii_NumIndexAttrs;
+
 			origin_node_id = istream_read_int32(reader);
 			origin_xid = istream_read_int32(reader);
 			deserialize_tuple_pkey(reader, idx_rel, csi->tdesc, values, NULL);
