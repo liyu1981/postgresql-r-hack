@@ -852,7 +852,7 @@ CoordinatorMain(int argc, char *argv[])
 #endif
 
 #ifdef COORDINATOR_DEBUG
-		elog(DEBUG1, "Coordinator: listening...");
+		elog(DEBUG3, "Coordinator: listening...");
 #endif
 
 		/* Allow sinval catchup interrupts while sleeping */
@@ -1051,12 +1051,12 @@ handle_imessage(IMessage *msg)
 
 #ifdef COORDINATOR_DEBUG
 	if (proc)
-		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(connected to db %d, local xid %d)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender,
 			 dboid, local_xid);
 	else
-		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(for which no PGPROC could be found)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender);
 #endif
