@@ -172,3 +172,4 @@ src/test/regress/pg_regress
 /daemon/config.h
 /stdutil/src/stdutil/private/stdarch_autoconf.h
 /src/backend/.directory
+/.directory
