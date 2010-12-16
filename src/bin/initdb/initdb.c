@@ -1163,6 +1163,18 @@ setup_config(void)
 						 "#default_text_search_config = 'pg_catalog.simple'",
 							  repltok);
 
+	/* liyu */
+	conflines = replace_token(conflines, "#default_transaction_isolation = 'serializable'",
+	                          "default_transaction_isolation = 'serializable'");
+	conflines = replace_token(conflines, "#default_transaction_replication = 'eager'",
+	                          "default_transaction_replication = 'eager'");
+	/* conflines = replace_token(conflines, "#replication = on", */
+	/*                           "replication = on"); */
+	conflines = replace_token(conflines, "#replication_gcs = 'spread'",
+	                          "replication_gcs = 'spread'");
+	conflines = replace_token(conflines, "#replication_group = 'postgres'",
+	                          "replication_group = 'postgres'");
+
 	snprintf(path, sizeof(path), "%s/postgresql.conf", pg_data);
 
 	writefile(path, conflines);
