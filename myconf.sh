@@ -21,9 +21,9 @@ config-postgres()
 		echo "OK."
 	fi
 
-	if [ $release_flag -eq 1 ];
+	if [ $release_flag -eq 0 ];
 	then
-		./configure --prefix=$install_prefix --exec-prefix=$install_prefix --enable-debug --enable-cassert --enable-coordinator-debug
+		./configure --prefix=$install_prefix --exec-prefix=$install_prefix --enable-debug --enable-cassert --enable-coordinatordebug
 	else
 		./configure --prefix=$install_prefix --exec-prefix=$install_prefix
 	fi
@@ -40,7 +40,7 @@ config-spread()
 		echo "OK."
 	fi
 
-	if [ $release_flag -eq 1 ];
+	if [ $release_flag -eq 0 ];
 	then
 		./configure --prefix=$install_prefix --exec-prefix=$install_prefix --enable-debug --enable-cassert
 	else
@@ -80,6 +80,8 @@ install_prefix=`readlink -f "$install_prefix"`
 #echo $install_prefix
 #echo $postgresr_flag
 #echo $spread_flag
+
+#exit
 
 if [ $postgresr_flag -eq 1 ];
 then
