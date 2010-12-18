@@ -1513,18 +1513,19 @@ handle_imessage_txn_aborted(gcs_group *group, IMessage *msg)
 	errcode = get_int32(&b);
 
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG5, "Coordinator: backend %d informs: txn (%d/%d) failed with errcode %d",
+	elog(DEBUG1, "Coordinator: backend %d informs: txn (%d/%d) failed with errcode %d",
 		 msg->sender, origin_node_id, origin_xid, errcode);
 
 	if (errcode == ERRCODE_T_R_SERIALIZATION_FAILURE)
 	{
-		elog(DEBUG5, "Coordinator: (%d/%d) serialization failure.",
+		elog(DEBUG1, "Coordinator: (%d/%d) serialization failure.",
 			 origin_node_id, origin_xid);
 	}
 #endif
 
 	xi = get_co_transaction_info(origin_node_id, origin_xid);
-	Assert(xi->local_backend_id == msg->sender);
+	/* liyu: FIXME, very dirty hack */
+	/* Assert(xi->local_backend_id == msg->sender); */
 	xi->aborted = true;
 
 	/*
