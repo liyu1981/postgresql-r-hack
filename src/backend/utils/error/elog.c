@@ -120,7 +120,7 @@ static void write_eventlog(int level, const char *line, int len);
 #endif
 
 /* We provide a small stack of ErrorData records for re-entrant cases */
-#define ERRORDATA_STACK_SIZE  100 /* liyu: dirty hack */
+#define ERRORDATA_STACK_SIZE  5
 
 static ErrorData errordata[ERRORDATA_STACK_SIZE];
 
@@ -146,7 +146,6 @@ static char formatted_log_time[FORMATTED_TS_LEN];
 			ereport(ERROR, (errmsg_internal("errstart was not called"))); \
 		} \
 	} while (0)
-
 
 static void log_line_prefix(StringInfo buf, ErrorData *edata);
 static void send_message_to_server_log(ErrorData *edata);
@@ -668,7 +667,7 @@ errcode_for_socket_access(void)
 		fmtbuf = expand_fmt_string(fmt, edata); \
 		initStringInfo(&buf); \
 		if ((appendval) && edata->targetfield) \
-			appendStringInfo(&buf, "%s\n", edata->targetfield); \
+			appendStringInfo(&buf, "%s {%d}\n", edata->targetfield, getpid()); \
 		/* Generate actual output --- have to use appendStringInfoVA */ \
 		for (;;) \
 		{ \

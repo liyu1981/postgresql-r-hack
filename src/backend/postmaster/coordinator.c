@@ -461,9 +461,12 @@ dispatch_ooo_msg(IMessage *msg, co_database *codb)
 			target = get_idle_worker(codb)->wi_backend_id;
 		forward_job(msg, codb, target);
 		process_ooo_msgs_for(codb, target);
+		elog(DEBUG1, "Coordinator:       forwarded job to bgworker:%d.", target);
     }
-	else
+	else {
 		add_ooo_msg(msg, codb, InvalidBackendId);
+		elog(DEBUG1, "Coordinator:       job delayed.");
+	}
 }
 
 /*
@@ -1057,12 +1060,12 @@ handle_imessage(IMessage *msg)
 
 #ifdef COORDINATOR_DEBUG
 	if (proc)
-		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(connected to db %d, local xid %d)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender,
 			 dboid, local_xid);
 	else
-		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(for which no PGPROC could be found)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender);
 #endif
@@ -1707,7 +1710,7 @@ bgworker_job_completed(void)
 {
 	/* Notify the coordinator of the job completion. */
 #ifdef COORDINATOR_DEBUG
-	ereport(DEBUG3,
+	ereport(DEBUG1,
 			(errmsg("bg worker [%d]: job completed.", MyProcPid)));
 #endif
 
@@ -1815,19 +1818,6 @@ BackgroundWorkerMain(int argc, char *argv[])
 	Oid			dbid;
 	char		dbname[NAMEDATALEN];
 	bool		terminate_worker = false;
-
-    /* liyu: add some code for debuging child process */
-	while(1)
-	{
-		sleep(1);
-		FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
-		if(fp != NULL)
-		{
-			fclose(fp);
-			break;
-		}
-	}
-    /* liyu: */
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
@@ -1938,7 +1928,11 @@ BackgroundWorkerMain(int argc, char *argv[])
 	 * applying change sets from remote transactions. Shouldn't affect
 	 * autovacuum.
 	 */
-	DefaultXactIsoLevel = XACT_REPEATABLE_READ;
+	/* liyu: so Backgroundworker still in repetable_read ? this is seemly
+	 * so wrong.
+	 */
+	/* DefaultXactIsoLevel = XACT_REPEATABLE_READ; */
+	DefaultXactIsoLevel = XACT_SERIALIZABLE;
 
 	/*
 	 * Use async commits for applying remote transactions. Shouldn't affect
@@ -2010,7 +2004,7 @@ BackgroundWorkerMain(int argc, char *argv[])
 	MyWorkerInfo->wi_state = WS_IDLE;
 
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG3, "bg worker [%d/%d]: connected to database %d",
+	elog(LOG, "bg worker [%d/%d]: connected to database %d",
 		 MyProcPid, MyBackendId, dbid);
 #endif
 
@@ -2029,6 +2023,23 @@ BackgroundWorkerMain(int argc, char *argv[])
 		msg = IMessageCreate(IMSGT_REGISTER_WORKER, 0);
 		IMessageActivate(msg, coordinator_id);
 	}
+
+    /* liyu: add some code for debuging replication bg worker process */
+	if (dbid != 1 /* template1 */) {
+		elog(DEBUG1, "bg worker [%d/%d]: stop wait debug ...", MyProcPid, MyBackendId);
+		while(1)
+		{
+			sleep(1);
+			FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
+			if(fp != NULL)
+			{
+				fclose(fp);
+				break;
+			}
+		}
+		elog(DEBUG1, "bg worker [%d/%d]: ... continue", MyProcPid, MyBackendId);
+	}
+    /* liyu: */
 
 	if (PostAuthDelay)
 		pg_usleep(PostAuthDelay * 1000000L);

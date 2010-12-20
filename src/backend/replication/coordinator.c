@@ -600,7 +600,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 #ifdef COORDINATOR_DEBUG
 	group->gcsi->funcs.get_node_desc(group, sender_node, node_desc);
-    elog(DEBUG1,
+    elog(DEBUG3,
 		 "Coordinator: received message %s\n"
 		 "             for database %d\n"
 		 "             from node %s of size %d",
@@ -829,7 +829,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 			if (!xi->aborted)
 			{
 #ifdef COORDINATOR_DEBUG
-				elog(DEBUG1, "Coordinator:     dispatching as a job");
+				elog(DEBUG3, "Coordinator:     dispatching as a job");
 #endif
 
 				LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED);

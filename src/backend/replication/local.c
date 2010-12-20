@@ -439,67 +439,94 @@ replication_global_commit(void)
 	Assert(!IsBackgroundWorkerProcess());
 	Assert(XactReplLevel != XACT_REPL_LAZY);
 
-	/* FIXME: indentation */
+//#ifdef DEBUG_CSET_COLL
+	elog(DEBUG1, "cset_replicate:     waiting for ordering decision");
+//#endif
+
+	send_commit_ordering_request();
+
+	/* liyu: below await_imessage will try to wait an commit imsg from
+	   gcs, but in a very ditry way: forever loop...
+
+	   this currently is known to be very dirty solution: it will
+	   breaks the pg's single query commitment. For instance, in
+	   original pg
+
+	       INSERT INTO sometable VALUES(...)
+	       COMMIT
+	       COMMIT (as many as you can)
+
+	   will work. No block, no competetion, no worry about the spin
+	   lock failure. But with await_imessage, that will break. The
+	   reason could be that:
+
+	       1. insert (without a begin transaction) will commmit as
+	       soon as the insertion done.  
+
+	       2. the following commit command does not know that, issuing
+	       another global_commit
+
+	       3. the next commit command do the same thing 
+
+	       ...  finally
+	       everyone will die because some backend will be panic :(
+
+	       FIXME: THIS MUST BE CHANGED!!
+	 */
+	/*
+	 * wait for our changeset to be delivered via the totally
+	 * ordered socket.
+	 */
+	msg = await_imessage();
+	
+	if (!MyProc->abortFlag)
 	{
-#ifdef DEBUG_CSET_COLL
-		elog(DEBUG3, "cset_replicate:     waiting for ordering decision");
-#endif
-
-		send_commit_ordering_request();
-
-		/*
-		 * wait for our changeset to be delivered via the totally
-		 * ordered socket.
-		 */
-		msg = await_imessage();
-
-		if (!MyProc->abortFlag)
+		IMessageGetReadBuffer(&b, msg);
+		if (msg->type == IMSGT_ORDERING)
 		{
-			IMessageGetReadBuffer(&b, msg);
-			if (msg->type == IMSGT_ORDERING)
-			{
-				origin_node_id = get_int32(&b);
-				origin_xid = get_int32(&b);
+			origin_node_id = get_int32(&b);
+			origin_xid = get_int32(&b);
 
-				IMessageRemove(msg);
+			IMessageRemove(msg);
 
-				/* store the local transaction id in shared memory */
-				Assert(origin_xid == MyProc->xid);
-				store_transaction_local_xid(origin_node_id, origin_xid, origin_xid);
+			/* store the local transaction id in shared memory */
+			Assert(origin_xid == MyProc->xid);
+			store_transaction_local_xid(origin_node_id, origin_xid, origin_xid);
+			
+			/* read the commit order id from shared memory */
+			Assert(CommitOrderIdIsValid(
+				       get_local_coid_by_origin(origin_node_id, origin_xid)));
 
-				/* read the commit order id from shared memory */
-				Assert(CommitOrderIdIsValid(
-						   get_local_coid_by_origin(origin_node_id, origin_xid)));
-
-				WaitUntilCommittable();
-
-				if (MyProc->abortFlag)
-					ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-									errmsg("could not serialize access due to "
-										   "concurrent update")));
-			}
-			else
-			{
-				elog(ERROR, "Replication protocol error in %s:%d\n"
-					 "got a message of type %s instead of a changeset.",
-					 __FILE__, __LINE__, decode_imessage_type(msg->type));
-
-				IMessageRemove(msg);
-			}
+			WaitUntilCommittable();
+			
+			if (MyProc->abortFlag)
+				ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				                errmsg("could not serialize access due to "
+				                       "concurrent update")));
 		}
 		else
 		{
-			if (msg)
-				IMessageRemove(msg);
-
-			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				errmsg("could not serialize access due to "
-					   "concurrent update")));
-
-			/* reset the abort flag */
-			MyProc->abortFlag = false;
+			elog(ERROR, "Replication protocol error in %s:%d\n"
+			     "got a message of type %s instead of a changeset.",
+			     __FILE__, __LINE__, decode_imessage_type(msg->type));
+			
+			IMessageRemove(msg);
 		}
 	}
+	else
+	{
+		if (msg)
+			IMessageRemove(msg);
+		
+		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+		                errmsg("could not serialize access due to "
+		                       "concurrent update")));
+		
+		/* reset the abort flag */
+		MyProc->abortFlag = false;
+	}
+
+	elog(DEBUG1, "cset_replicate:     commited!");
 }
 
 
