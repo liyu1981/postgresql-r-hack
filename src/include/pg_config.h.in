@@ -707,6 +707,9 @@
 /* Define to 1 to build with replication support. (--enable-replication) */
 #undef REPLICATION
 
+/* Define to 1 to build with coordinator debug support. (--enable-coordinatordebug) */
+#undef COORDINATOR_DEBUG
+
 /* RELSEG_SIZE is the maximum number of blocks allowed in one disk file. Thus,
    the maximum size of a single file is RELSEG_SIZE * BLCKSZ; relations bigger
    than that are divided into multiple files. RELSEG_SIZE * BLCKSZ must be

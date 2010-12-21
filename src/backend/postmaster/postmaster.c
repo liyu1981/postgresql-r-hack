@@ -1352,6 +1352,16 @@ ServerLoop(void)
 	time_t		now,
 				last_touch_time;
 
+	/* liyu: 
+	   hack. Check env varibale PGR_REPLICATION_OFF to turn off replication
+	 */
+	char* pgr_replication_off = getenv("PGR_REPLICATION_OFF");
+	if(pgr_replication_off != NULL
+	   && strcmp(pgr_replication_off, "yes") == 0) {
+		replication_enabled = false;
+		elog(LOG, "Replication is disable by env variable PGR_REPLICATION_OFF=yes");
+	}
+
 	last_touch_time = time(NULL);
 
 	nSockets = initMasks(&readmask);

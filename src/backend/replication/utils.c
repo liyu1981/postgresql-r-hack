@@ -617,7 +617,7 @@ WaitUntilCommittable(void)
 		goto abort_waiting;
 
 	my_coid = get_local_coid_by_local_xid(MyProc->xid);
-	elog(DEBUG5, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
+	elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
 		 MyProcPid, MyBackendId, my_coid);
 
 	/*
@@ -653,7 +653,7 @@ WaitUntilCommittable(void)
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
-			elog(DEBUG5, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for coid %d",
+			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for coid %d",
 				 MyProcPid, MyBackendId, my_coid, dep_coid);
 			pg_usleep(30000L);
 
@@ -668,7 +668,7 @@ WaitUntilCommittable(void)
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
-			elog(DEBUG5, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for txn %d",
+			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for txn %d",
 				 MyProcPid, MyBackendId, my_coid, xid);
 			pg_usleep(30000L);
 		}
@@ -678,7 +678,7 @@ WaitUntilCommittable(void)
 	}
 
 abort_waiting:
-	elog(DEBUG5, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d result: %s",
+	elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d result: %s",
 		 MyProcPid, MyBackendId, my_coid,
 		 (MyProc->abortFlag ? "MUST ABORT!" : "commit now!"));
 }

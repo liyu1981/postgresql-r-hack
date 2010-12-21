@@ -151,6 +151,9 @@ MemoryContext DatabaseListCxt = NULL;
 WorkerInfo MyWorkerInfo = NULL;
 WorkerInfo terminatable_worker = NULL;
 
+/* liyu: add one global flag for spread */
+bool coordinator_now_terminate = false;
+
 #ifdef EXEC_BACKEND
 static pid_t coordinator_forkexec(void);
 static pid_t bgworker_forkexec(void);
@@ -460,9 +463,12 @@ dispatch_ooo_msg(IMessage *msg, co_database *codb)
 			target = get_idle_worker(codb)->wi_backend_id;
 		forward_job(msg, codb, target);
 		process_ooo_msgs_for(codb, target);
+		elog(DEBUG1, "Coordinator:       forwarded job to bgworker:%d.", target);
     }
-	else
+	else {
 		add_ooo_msg(msg, codb, InvalidBackendId);
+		elog(DEBUG1, "Coordinator:       job delayed.");
+	}
 }
 
 /*
@@ -844,17 +850,16 @@ CoordinatorMain(int argc, char *argv[])
 		coordinator_determine_sleep(can_launch, false, &nap);
 
 		/* Initialize variables for listening on sockets */ 
-		/* FD_ZERO(&socks); */
-		/* max_sock_id = 0; */
-		/* socket_ready = false; */
+		FD_ZERO(&socks);
+		max_sock_id = 0;
+		socket_ready = false;
 
 #ifdef REPLICATION
-		/* FIX ME: spread does not use sockets, dirty hack currently */
-		coordinator_replication_reg_gcs(NULL, &socket_ready);
+		coordinator_replication_reg_gcs(&socks, &max_sock_id);
 #endif
 
 #ifdef COORDINATOR_DEBUG
-		elog(DEBUG1, "Coordinator: listening...");
+		elog(DEBUG3, "Coordinator: listening...");
 #endif
 
 		/* Allow sinval catchup interrupts while sleeping */
@@ -888,8 +893,6 @@ CoordinatorMain(int argc, char *argv[])
 		sigaddset(&sigmask, SIGUSR2);
 		sigprocmask(SIG_BLOCK, &sigmask, &oldmask);
 
-		/* FIX ME: dirtly hack, just comment out checking socket since
-		 * spread does not use it */
 		/*
 		 * Final check for the (now blocked) signals. Prevent waiting on
 		 * events on the file descriptors with pselect(), if we've already
@@ -898,18 +901,17 @@ CoordinatorMain(int argc, char *argv[])
 		if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP)
 		{
 			sigemptyset(&sigmask);
-			E_handle_events();
-		/* 	if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap, */
-		/* 				&sigmask) < 0) */
-		/* 	{ */
-		/* 		if (errno != EINTR) */
-		/* 		{ */
-		/* 			elog(WARNING, "Coordinator: pselect failed: %m"); */
-		/* 			socket_ready = true; */
-		/* 		} */
-		/* 	} */
-		/* 	else */
-		/* 		socket_ready = true; */
+			if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap,
+						&sigmask) < 0)
+			{
+				if (errno != EINTR)
+				{
+					elog(WARNING, "Coordinator: pselect failed: %m");
+					socket_ready = true;
+				}
+			}
+			else
+				socket_ready = true;
 		}
 
 		sigprocmask(SIG_SETMASK, &oldmask, NULL);
@@ -925,7 +927,10 @@ CoordinatorMain(int argc, char *argv[])
 
 		/* the normal shutdown case */
 		if (got_SIGTERM)
+		{
+			coordinator_now_terminate = true;
 			break;
+		}
 
 		if (got_SIGHUP)
 		{
@@ -980,10 +985,6 @@ CoordinatorMain(int argc, char *argv[])
 			continue;
 		}
 
-		/* liyu: different to socket based egcs implementation, check
-		 * socket (=recv msg) each possible time. The efficiency
-		 * should not be problem, since the spread_recv will do a
-		 * check. */
 		/* handle sockets with pending reads */
 		if (socket_ready)
 		{
@@ -1704,7 +1705,7 @@ bgworker_job_completed(void)
 {
 	/* Notify the coordinator of the job completion. */
 #ifdef COORDINATOR_DEBUG
-	ereport(DEBUG3,
+	ereport(DEBUG1,
 			(errmsg("bg worker [%d]: job completed.", MyProcPid)));
 #endif
 
@@ -1812,19 +1813,6 @@ BackgroundWorkerMain(int argc, char *argv[])
 	Oid			dbid;
 	char		dbname[NAMEDATALEN];
 	bool		terminate_worker = false;
-
-    /* liyu: add some code for debuging child process */
-	while(1)
-	{
-		sleep(1);
-		FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
-		if(fp != NULL)
-		{
-			fclose(fp);
-			break;
-		}
-	}
-    /* liyu: */
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
@@ -1935,7 +1923,11 @@ BackgroundWorkerMain(int argc, char *argv[])
 	 * applying change sets from remote transactions. Shouldn't affect
 	 * autovacuum.
 	 */
-	DefaultXactIsoLevel = XACT_REPEATABLE_READ;
+	/* liyu: so Backgroundworker still in repetable_read ? this is seemly
+	 * so wrong.
+	 */
+	/* DefaultXactIsoLevel = XACT_REPEATABLE_READ; */
+	DefaultXactIsoLevel = XACT_SERIALIZABLE;
 
 	/*
 	 * Use async commits for applying remote transactions. Shouldn't affect
@@ -2007,7 +1999,7 @@ BackgroundWorkerMain(int argc, char *argv[])
 	MyWorkerInfo->wi_state = WS_IDLE;
 
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG3, "bg worker [%d/%d]: connected to database %d",
+	elog(LOG, "bg worker [%d/%d]: connected to database %d",
 		 MyProcPid, MyBackendId, dbid);
 #endif
 
@@ -2026,6 +2018,23 @@ BackgroundWorkerMain(int argc, char *argv[])
 		msg = IMessageCreate(IMSGT_REGISTER_WORKER, 0);
 		IMessageActivate(msg, coordinator_id);
 	}
+
+    /* liyu: add some code for debuging replication bg worker process */
+	if (dbid != 1 /* template1 */) {
+		elog(DEBUG1, "bg worker [%d/%d]: stop wait debug ...", MyProcPid, MyBackendId);
+		while(1)
+		{
+			sleep(1);
+			FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
+			if(fp != NULL)
+			{
+				fclose(fp);
+				break;
+			}
+		}
+		elog(DEBUG1, "bg worker [%d/%d]: ... continue", MyProcPid, MyBackendId);
+	}
+    /* liyu: */
 
 	if (PostAuthDelay)
 		pg_usleep(PostAuthDelay * 1000000L);

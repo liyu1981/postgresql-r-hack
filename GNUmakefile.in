@@ -29,6 +29,7 @@ html man:
 install:
 	$(MAKE) -C src $@
 	$(MAKE) -C config $@
+	$(MAKE) -C runscript $@
 	@echo "PostgreSQL installation complete."
 
 install-docs:

@@ -143,10 +143,10 @@ static char formatted_log_time[FORMATTED_TS_LEN];
 		if (errordata_stack_depth < 0) \
 		{ \
 			errordata_stack_depth = -1; \
+			printf("Oops!: in [%d/%d]", getpid(), MyBackendId); \
 			ereport(ERROR, (errmsg_internal("errstart was not called"))); \
 		} \
 	} while (0)
-
 
 static void log_line_prefix(StringInfo buf, ErrorData *edata);
 static void send_message_to_server_log(ErrorData *edata);
@@ -668,7 +668,7 @@ errcode_for_socket_access(void)
 		fmtbuf = expand_fmt_string(fmt, edata); \
 		initStringInfo(&buf); \
 		if ((appendval) && edata->targetfield) \
-			appendStringInfo(&buf, "%s\n", edata->targetfield); \
+			appendStringInfo(&buf, "%s {%d}\n", edata->targetfield, getpid()); \
 		/* Generate actual output --- have to use appendStringInfoVA */ \
 		for (;;) \
 		{ \

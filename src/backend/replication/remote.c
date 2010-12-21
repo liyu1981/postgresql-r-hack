@@ -171,7 +171,10 @@ cset_parse_open_statement(CsetCmdType type)
 	csi->base_rel = heap_open(csi->localRelOid, RowExclusiveLock);
 	Assert(csi->base_rel);
 	Assert(csi->base_rel->rd_rel->relkind == RELKIND_RELATION);
-	Assert(csi->base_rel->rd_rel->relhasindex);
+	/* liyu: Is there a need to check whether there is hash index ?
+	 * Can btree also do the work? Anyway, dirty hack first.
+	 */
+	/* Assert(csi->base_rel->rd_rel->relhasindex); */
 
 	/*
 	 * Init the result relation, which opens the required indices.

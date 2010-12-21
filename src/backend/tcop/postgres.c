@@ -4281,11 +4281,11 @@ bgworker_commit_request(IMessage *msg)
 	coid = get_local_coid_by_origin(origin_node_id, origin_xid);
 	Assert(CommitOrderIdIsValid(coid));
 
-#ifdef DEBUG_CSET_APPL
-	elog(DEBUG3, "bg worker [%d/%d]: received commit decision for (%d/%d), coid %d, having already received %d of %d csets",
+//#ifdef DEBUG_CSET_APPL
+	elog(DEBUG1, "bg worker [%d/%d]: received commit decision for (%d/%d), coid %d, having already received %d of %d csets",
 		 MyProcPid, MyBackendId, origin_node_id, origin_xid, coid,
 		 csets_recvd_counter, count_csets);
-#endif
+//#endif
 
 	set_ps_display("remote transaction", false);
 
@@ -4296,10 +4296,10 @@ bgworker_commit_request(IMessage *msg)
 
 		if (!MyProc->abortFlag)
 		{
-#ifdef DEBUG_CSET_APPL
-			elog(DEBUG3, "bg worker [%d/%d]: committing remote transaction (%d/%d)",
+//#ifdef DEBUG_CSET_APPL
+			elog(DEBUG1, "bg worker [%d/%d]: committing remote transaction (%d/%d)",
 				 MyProcPid, MyBackendId, origin_node_id, origin_xid);
-#endif
+//#endif
 
 			CommitTransactionCommand();
 
@@ -4309,10 +4309,10 @@ bgworker_commit_request(IMessage *msg)
 		}
 		else
 		{
-#ifdef DEBUG_CSET_APPL
-			elog(DEBUG3, "bg worker [%d/%d]: aborting remote transaction",
+//#ifdef DEBUG_CSET_APPL
+			elog(DEBUG1, "bg worker [%d/%d]: aborting remote transaction",
 				 MyProcPid, MyBackendId);
-#endif
+//#endif
 
 			/*
 			 * This is a remote transaction, for which we'll eventually

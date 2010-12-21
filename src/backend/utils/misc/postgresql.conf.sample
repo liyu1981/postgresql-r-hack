@@ -458,8 +458,10 @@
 					# only default tablespace
 #check_function_bodies = on
 #default_transaction_isolation = 'read committed'
+#default_transaction_isolation = 'serializable'
 #default_transaction_read_only = off
 #default_transaction_replication = 'sync'
+#default_transaction_replication = 'eager'
 #session_replication_role = 'origin'
 #statement_timeout = 0			# in milliseconds, 0 is disabled
 #vacuum_freeze_min_age = 50000000
@@ -553,6 +555,7 @@
 # REPLICATION OPTIONS
 #---------------------------------------------------------------------------
 
-#replication = off			# Enable replication?  'on' 
-#replication_gcs = 'ensemble'		# the GCS to use for replication
+#replication = on			# Enable replication?  'on' 
+#replication_gcs = 'spread'		# the GCS to use for replication
 #replication_group = 'postgres'		# the group to use for replication
+#replication_seed = on
