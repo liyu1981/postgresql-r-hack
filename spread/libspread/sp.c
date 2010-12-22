@@ -1179,62 +1179,61 @@ static	int	SP_internal_multicast( mailbox mbox, service service_type,
 }
 
 int	SP_receive( mailbox mbox, service *service_type, char sender[MAX_GROUP_NAME],
-		    int max_groups, int *num_groups, char groups[][MAX_GROUP_NAME],
-		    int16 *mess_type, int *endian_mismatch,
-		    int max_mess_len, char *mess )
+	            int max_groups, int *num_groups, char groups[][MAX_GROUP_NAME],
+	            int16 *mess_type, int *endian_mismatch,
+	            int max_mess_len, char *mess )
 {
-	int		ret;
-	scatter		recv_scat;
+	int     ret;
+	scatter	recv_scat;
 
 	recv_scat.num_elements = 1;
 	recv_scat.elements[0].len = max_mess_len;
 	recv_scat.elements[0].buf = mess;
 
 	ret = SP_scat_receive( mbox, service_type, sender, max_groups, num_groups, groups, 
-				mess_type, endian_mismatch, &recv_scat );
+	                       mess_type, endian_mismatch, &recv_scat );
 	return( ret );
 }
 
 int	SP_scat_receive( mailbox mbox, service *service_type, char sender[MAX_GROUP_NAME],
-			 int max_groups, int *num_groups, char groups[][MAX_GROUP_NAME],
-			 int16 *mess_type, int *endian_mismatch,
-			 scatter *scat_mess )
+	                 int max_groups, int *num_groups, char groups[][MAX_GROUP_NAME],
+	                 int16 *mess_type, int *endian_mismatch,
+	                 scatter *scat_mess )
 {
+	static char     dummy_buf[10240];
+	int             This_session_message_saved;
+	int             drop_semantics;
+	message_header  mess_head;
+	message_header *head_ptr;
+	char           *buf_ptr;
+	int32           temp_mess_type;
+	int             len, remain, ret;
+	int             max_mess_len;
+	int             short_buffer;
+	int             short_groups;
+	int             to_read;
+	int             scat_index, byte_index;
+	int             ses;
+	char            This_session_private_group[MAX_GROUP_NAME];
+	int             i;
+	int32           old_type;
 
-static	char		dummy_buf[10240];
-        int             This_session_message_saved;
-        int             drop_semantics;
-	message_header	mess_head;
-	message_header	*head_ptr;
-	char		*buf_ptr;
-        int32           temp_mess_type;
-	int		len, remain, ret;
-	int		max_mess_len;
-	int		short_buffer;
-	int		short_groups;
-	int		to_read;
-	int		scat_index, byte_index;
-	int		ses;
-	char		This_session_private_group[MAX_GROUP_NAME];
-	int		i;
-        int32           old_type;
-
-        /* I must acquire the lock for this mbox before the Struct_mutex lock because
-         * I must be sure ONLY one thread is in recv for this mbox, EVEN for 
-         * this initial 'get the session and session state' operation.
-         * Otherwise one thread enters this and gets the state and sees no saved message
-         * then grabs the mbox mutex and discoveres buffer too short and so regrabs the
-         * Struct_mutex and adds the saved header, but during this time another thread
-         * has entered recv for the same mbox and already grabbed the struct_mutex and also
-         * read that no saved mesage exists and is now waiting for the mbox mutex.
-         * When it the first thread returns and releases the mbox mutex, the second thread will
-         * grab it and enter--but it will think there is NO saved messaage when in reality
-         * there IS one. This will cause MANY PROBLEMS :-)
-         *
-         * NOTE: locking and unlocking the Struct_mutex multiple times during this is OK
-         * BECAUSE struct_Mutex only locks non-blocking operations that are guaranteed to complete
-         * quickly and never take additional locks.
-         */
+	/* I must acquire the lock for this mbox before the Struct_mutex lock because
+	 * I must be sure ONLY one thread is in recv for this mbox, EVEN for 
+	 * this initial 'get the session and session state' operation.
+	 * Otherwise one thread enters this and gets the state and sees no saved message
+	 * then grabs the mbox mutex and discoveres buffer too short and so regrabs the
+	 * Struct_mutex and adds the saved header, but during this time another thread
+	 * has entered recv for the same mbox and already grabbed the struct_mutex and also
+	 * read that no saved mesage exists and is now waiting for the mbox mutex.
+	 * When it the first thread returns and releases the mbox mutex, the second thread will
+	 * grab it and enter--but it will think there is NO saved messaage when in reality
+	 * there IS one. This will cause MANY PROBLEMS :-)
+	 *
+	 * NOTE: locking and unlocking the Struct_mutex multiple times during this is OK
+	 * BECAUSE struct_Mutex only locks non-blocking operations that are guaranteed to complete
+	 * quickly and never take additional locks.
+	 */
 	Mutex_lock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 
 	Mutex_lock( &Struct_mutex );
@@ -1242,159 +1241,162 @@ static	char		dummy_buf[10240];
 	ses = SP_get_session( mbox );
 	if( ses < 0 ){
 		Mutex_unlock( &Struct_mutex );
-                Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+		Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 		return( ILLEGAL_SESSION );
 	}
 
-        if( Sessions[ses].state != SESS_ACTIVE ) {
+	if( Sessions[ses].state != SESS_ACTIVE ) {
 		Mutex_unlock( &Struct_mutex );
-                Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+		Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 		return( NET_ERROR_ON_SESSION );
 	}
 
 	strcpy( This_session_private_group, Sessions[ses].private_group_name );
 
-        if (Sessions[ses].recv_message_saved) {
-                memcpy(&mess_head, &(Sessions[ses].recv_saved_head), sizeof(message_header) );
-                This_session_message_saved = 1;
-        } else {
-                This_session_message_saved = 0;
-        }
+	if (Sessions[ses].recv_message_saved) {
+		memcpy(&mess_head, &(Sessions[ses].recv_saved_head), sizeof(message_header) );
+		This_session_message_saved = 1;
+	} else {
+		This_session_message_saved = 0;
+	}
 
 	Mutex_unlock( &Struct_mutex );
         
 	head_ptr = (message_header *)&mess_head;
 	buf_ptr = (char *)&mess_head;
 
-        drop_semantics = Is_drop_recv(*service_type);
+	drop_semantics = Is_drop_recv(*service_type);
+	
+	if (!This_session_message_saved) {
+		/* read up to size of message_header */
+		for( len=0, remain = sizeof(message_header); remain > 0;  len += ret, remain -= ret )
+		{
+			while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 )
+			      && ((sock_errno == EINTR) || 
+			          (sock_errno == EAGAIN) || 
+			          (sock_errno == EWOULDBLOCK)) )
+			{};
 
-        if (!This_session_message_saved) {
-                /* read up to size of message_header */
-                for( len=0, remain = sizeof(message_header); remain > 0;  len += ret, remain -= ret )
-                {
-                        while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 )
-                              && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                                ;
-                        if( ret <=0 )
-                        {
-                                Alarm( SESSION, "SP_scat_receive: failed receiving header on session %d (ret: %d len: %d): %s\n", mbox, ret, len, sock_strerror(sock_errno) );
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                    Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                                    Mutex_unlock( &Struct_mutex );
-                                    Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                    return( CONNECTION_CLOSED );
-                                }
-                                Sessions[ses].state = SESS_ERROR;
-                                Mutex_unlock( &Struct_mutex );
+			if( ret <=0 )
+			{
+				Alarm( SESSION, "SP_scat_receive: failed receiving header on session %d (ret: %d len: %d): %s\n", mbox, ret, len, sock_strerror(sock_errno) );
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( CONNECTION_CLOSED );
+				}
+				Sessions[ses].state = SESS_ERROR;
+				Mutex_unlock( &Struct_mutex );
+				
+				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+				return( CONNECTION_CLOSED );
+			}
+		}
 
-                                Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                return( CONNECTION_CLOSED );
-                        }
-                }
-
-                /* Fliping message header to my form if needed */
-                if( !Same_endian( head_ptr->type ) ) 
-                {
-                        Flip_mess( head_ptr );
-                }
-        }
-        /* Validate user's scatter */
+		/* Fliping message header to my form if needed */
+		if( !Same_endian( head_ptr->type ) ) 
+		{
+			Flip_mess( head_ptr );
+		}
+	}
+	/* Validate user's scatter */
 	for( max_mess_len = 0, i=0; i < scat_mess->num_elements; i++ ) {
-                if ( scat_mess->elements[i].len < 0 )   {
-                        if ( !drop_semantics && !This_session_message_saved) {
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                        Mutex_unlock( &Struct_mutex );
-                                        Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                        return( ILLEGAL_SESSION );
-                                }
-                                memcpy(&(Sessions[ses].recv_saved_head), &mess_head, sizeof(message_header) );
-                                Sessions[ses].recv_message_saved = 1;
-                                Mutex_unlock( &Struct_mutex );
-                        }
-                        Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                        return( ILLEGAL_MESSAGE );
-                }
+		if ( scat_mess->elements[i].len < 0 )   {
+			if ( !drop_semantics && !This_session_message_saved) {
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( ILLEGAL_SESSION );
+				}
+				memcpy(&(Sessions[ses].recv_saved_head), &mess_head, sizeof(message_header) );
+				Sessions[ses].recv_message_saved = 1;
+				Mutex_unlock( &Struct_mutex );
+			}
+			Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+			return( ILLEGAL_MESSAGE );
+		}
 		max_mess_len += scat_mess->elements[i].len;
-        }
-        /* Validate num_groups and data_len */
-        if (head_ptr->num_groups < 0) {
-            /* reject this message since it has an impossible (negative) num_groups
-             * This is likely to be caused by a malicious attack or memory corruption
-             */
-            Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-            return( ILLEGAL_MESSAGE );
-        }
-        if (head_ptr->data_len < 0) {
-            /* reject this message since it has an impossible (negative) data_len
-             * This is likely to be caused by a malicious attack or memory corruption
-             */
-            Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-            return( ILLEGAL_MESSAGE );
-        }
+	}
+	/* Validate num_groups and data_len */
+	if (head_ptr->num_groups < 0) {
+		/* reject this message since it has an impossible (negative) num_groups
+		 * This is likely to be caused by a malicious attack or memory corruption
+		 */
+		Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+		return( ILLEGAL_MESSAGE );
+	}
+	if (head_ptr->data_len < 0) {
+		/* reject this message since it has an impossible (negative) data_len
+		 * This is likely to be caused by a malicious attack or memory corruption
+		 */
+		Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+		return( ILLEGAL_MESSAGE );
+	}
 
-        /* Check if sufficient buffer space for groups and data */
-        if (!drop_semantics) {
-                if ( (head_ptr->num_groups > max_groups) || (head_ptr->data_len > max_mess_len) ) {
-                        if (!This_session_message_saved) {
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                        Mutex_unlock( &Struct_mutex );
-                                        Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                        return( ILLEGAL_SESSION );
-                                }
-                                memcpy(&(Sessions[ses].recv_saved_head), &mess_head, sizeof(message_header) );
-                                Sessions[ses].recv_message_saved = 1;
-                                Mutex_unlock( &Struct_mutex );
-                        }
-                        /* When *_TOO_SHORT error will be returned, provide caller with all available information:
-                         * service_type
-                         * sender
-                         * mess_type
-                         * 
-                         * The num_groups field and endian_mismatch field are used to specify the required
-                         * size of the groups array and message body array in order to fit the current message
-                         * so, they do NOT have their usual meaning. 
-                         * If number of groups in the message is > max_groups then the number of required groups 
-                         *   is returned as a negative value in the num_groups field.
-                         * If the size of the message is > max_mess_len, then the required size in bytes is 
-                         *   returned as a negative value in the endian_mismatch field.
-                         */
-                        if ( Is_regular_mess( head_ptr->type ) || Is_reject_mess( head_ptr->type ) )
-                        {
-                                temp_mess_type = head_ptr->hint;
-                                if ( !Same_endian( head_ptr->hint ) ) {
-                                        temp_mess_type = Flip_int32( temp_mess_type );
-                                }
-                                temp_mess_type = Clear_endian( temp_mess_type );
-                                *mess_type = ( temp_mess_type >> 8 ) & 0x0000ffff;
-                        }
-                        else 
-                                *mess_type = 0;
-                        *service_type = Clear_endian( head_ptr->type );
-                        if (head_ptr->num_groups > max_groups)
-                                *num_groups = -(head_ptr->num_groups);
-                        else    
-                                *num_groups = 0;
-                        if (head_ptr->data_len > max_mess_len)
-                                *endian_mismatch = -(head_ptr->data_len);
-                        else
-                                *endian_mismatch = 0;
+	/* Check if sufficient buffer space for groups and data */
+	if (!drop_semantics) {
+		if ( (head_ptr->num_groups > max_groups) || (head_ptr->data_len > max_mess_len) ) {
+			if (!This_session_message_saved) {
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( ILLEGAL_SESSION );
+				}
+				memcpy(&(Sessions[ses].recv_saved_head), &mess_head, sizeof(message_header) );
+				Sessions[ses].recv_message_saved = 1;
+				Mutex_unlock( &Struct_mutex );
+			}
+			/* When *_TOO_SHORT error will be returned, provide caller with all available information:
+			 * service_type
+			 * sender
+			 * mess_type
+			 * 
+			 * The num_groups field and endian_mismatch field are used to specify the required
+			 * size of the groups array and message body array in order to fit the current message
+			 * so, they do NOT have their usual meaning. 
+			 * If number of groups in the message is > max_groups then the number of required groups 
+			 *   is returned as a negative value in the num_groups field.
+			 * If the size of the message is > max_mess_len, then the required size in bytes is 
+			 *   returned as a negative value in the endian_mismatch field.
+			 */
+			if ( Is_regular_mess( head_ptr->type ) || Is_reject_mess( head_ptr->type ) )
+			{
+				temp_mess_type = head_ptr->hint;
+				if ( !Same_endian( head_ptr->hint ) ) {
+					temp_mess_type = Flip_int32( temp_mess_type );
+				}
+				temp_mess_type = Clear_endian( temp_mess_type );
+				*mess_type = ( temp_mess_type >> 8 ) & 0x0000ffff;
+			}
+			else 
+				*mess_type = 0;
+			*service_type = Clear_endian( head_ptr->type );
+			if (head_ptr->num_groups > max_groups)
+				*num_groups = -(head_ptr->num_groups);
+			else    
+				*num_groups = 0;
+			if (head_ptr->data_len > max_mess_len)
+				*endian_mismatch = -(head_ptr->data_len);
+			else
+				*endian_mismatch = 0;
 
-                        /* Return sender field to caller */
-                        strncpy( sender, head_ptr->private_group_name, MAX_GROUP_NAME );
+			/* Return sender field to caller */
+			strncpy( sender, head_ptr->private_group_name, MAX_GROUP_NAME );
 
-                        Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                        if (*num_groups)
-                                return( GROUPS_TOO_SHORT );
-                        else
-                                return( BUFFER_TOO_SHORT );
-                }
-        }
+			Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+			if (*num_groups)
+				return( GROUPS_TOO_SHORT );
+			else
+				return( BUFFER_TOO_SHORT );
+		}
+	}
 	/* Compute mess_type and endian_mismatch from hint */
 	if( Is_regular_mess( head_ptr->type ) || Is_reject_mess( head_ptr->type)  )
 	{
@@ -1405,9 +1407,9 @@ static	char		dummy_buf[10240];
 		}else{
 			*endian_mismatch = 0;
 		}
-                head_ptr->hint = Clear_endian( head_ptr->hint );
-                head_ptr->hint = ( head_ptr->hint >> 8 ) & 0x0000ffff;
-                *mess_type = head_ptr->hint;
+		head_ptr->hint = Clear_endian( head_ptr->hint );
+		head_ptr->hint = ( head_ptr->hint >> 8 ) & 0x0000ffff;
+		*mess_type = head_ptr->hint;
 	}else{
 		*mess_type = -1; /* marks the index (0..n-1) of the member in the group */
 		*endian_mismatch = 0;
@@ -1415,38 +1417,38 @@ static	char		dummy_buf[10240];
 
 	strncpy( sender, head_ptr->private_group_name, MAX_GROUP_NAME );
         
-        /* if a reject message read the extra old_type field first, and merge with head_ptr->type */
-        if ( Is_reject_mess( head_ptr->type ) )
-        {
-                remain = 4;
-                buf_ptr = (char *)&old_type;
-                for( len=0; remain > 0; len += ret, remain -= ret )
-                {
-                        while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 ) && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                                ;
-                        if( ret <=0 )
-                        {
-                                Alarm( SESSION, "SP_scat_receive: failed receiving old_type for reject on session %d, ret is %d: %s\n", mbox, ret, sock_strerror(sock_errno));
+	/* if a reject message read the extra old_type field first, and merge with head_ptr->type */
+	if ( Is_reject_mess( head_ptr->type ) )
+	{
+		remain = 4;
+		buf_ptr = (char *)&old_type;
+		for( len=0; remain > 0; len += ret, remain -= ret )
+		{
+			while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 ) && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
+				;
+			if( ret <=0 )
+			{
+				Alarm( SESSION, "SP_scat_receive: failed receiving old_type for reject on session %d, ret is %d: %s\n", mbox, ret, sock_strerror(sock_errno));
 
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                    Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                                    Mutex_unlock( &Struct_mutex );
-                                    Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                    return( CONNECTION_CLOSED );
-                                }
-                                Sessions[ses].state = SESS_ERROR;
-                                Mutex_unlock( &Struct_mutex );
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( CONNECTION_CLOSED );
+				}
+				Sessions[ses].state = SESS_ERROR;
+				Mutex_unlock( &Struct_mutex );
 
-                                Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                return( CONNECTION_CLOSED );
-                        }
-                }
-                /* endian flip it */
-                if ( !Same_endian( head_ptr->type ) )
-                        old_type = Flip_int32(old_type);
-        }
+				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+				return( CONNECTION_CLOSED );
+			}
+		}
+		/* endian flip it */
+		if ( !Same_endian( head_ptr->type ) )
+			old_type = Flip_int32(old_type);
+	}
 
 	/* read the destination groups */
 	buf_ptr = (char *)groups;
@@ -1463,21 +1465,21 @@ static	char		dummy_buf[10240];
 	for( len=0; remain > 0; len += ret, remain -= ret )
 	{
 		while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 ) && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                        ;
+			;
 		if( ret <=0 )
 		{
 			Alarm( SESSION, "SP_scat_receive: failed receiving groups on session %d, ret is %d: %s\n", mbox, ret, sock_strerror(sock_errno));
 
-                        Mutex_lock( &Struct_mutex );
-                        ses = SP_get_session( mbox );
-                        if( ses < 0 ){
-                            Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                            Mutex_unlock( &Struct_mutex );
-                            Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                            return( CONNECTION_CLOSED );
-                        }
-                        Sessions[ses].state = SESS_ERROR;
-                        Mutex_unlock( &Struct_mutex );
+			Mutex_lock( &Struct_mutex );
+			ses = SP_get_session( mbox );
+			if( ses < 0 ){
+				Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+				Mutex_unlock( &Struct_mutex );
+				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+				return( CONNECTION_CLOSED );
+			}
+			Sessions[ses].state = SESS_ERROR;
+			Mutex_unlock( &Struct_mutex );
 
 			Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 			return( CONNECTION_CLOSED );
@@ -1492,22 +1494,22 @@ static	char		dummy_buf[10240];
 			to_read = remain;
 			if( to_read > sizeof( dummy_buf ) ) to_read = sizeof( dummy_buf );
 			while(((ret = recv( mbox, dummy_buf, to_read, 0 )) == -1 ) && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                                ;
+				;
 			if( ret <=0 )
 			{
 				Alarm( SESSION, "SP_scat_receive: failed receiving groups overflow on session %d, ret is %d: %s\n", 
-                                       mbox, ret, sock_strerror(sock_errno) );
+				       mbox, ret, sock_strerror(sock_errno) );
 
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                    Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                                    Mutex_unlock( &Struct_mutex );
-                                    Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                    return( CONNECTION_CLOSED );
-                                }
-                                Sessions[ses].state = SESS_ERROR;
-                                Mutex_unlock( &Struct_mutex );
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( CONNECTION_CLOSED );
+				}
+				Sessions[ses].state = SESS_ERROR;
+				Mutex_unlock( &Struct_mutex );
 
 				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 				return( CONNECTION_CLOSED );
@@ -1530,16 +1532,16 @@ static	char		dummy_buf[10240];
 	/* 
 	 * pay attention that if head_ptr->data_len is smaller than max_mess_len we need to
 	 * change scat, do recvmsg, and restore scat, and then check ret.
-         * ret = recvmsg( mbox, &msg, 0 ); 
-         * if( ret <=0 )
-         * {
-         *      Alarm( SESSION, "SP_scat_receive: failed receiving message on session %d\n", mbox );
+	 * ret = recvmsg( mbox, &msg, 0 ); 
+	 * if( ret <=0 )
+	 * {
+	 *      Alarm( SESSION, "SP_scat_receive: failed receiving message on session %d\n", mbox );
 	 *
 	 *	Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 	 *
-         *      SP_kill( mbox );
-         *      return;
-         * }
+	 *      SP_kill( mbox );
+	 *      return;
+	 * }
 	 */
 
 	/* calculate scat_index and byte_index based on ret and scat_mess */
@@ -1555,23 +1557,23 @@ static	char		dummy_buf[10240];
 		to_read = scat_mess->elements[scat_index].len - byte_index;
 		if( to_read > remain ) to_read = remain;
 		while(((ret = recv( mbox, &scat_mess->elements[scat_index].buf[byte_index], to_read, 0 )) == -1 )
-                      && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                        ;
+		      && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
+			;
 		if( ret <=0 )
 		{
 			Alarm( SESSION, "SP_scat_receive: failed receiving message on session %d, ret is %d: %s\n", 
-                               mbox, ret, sock_strerror(sock_errno) );
+			       mbox, ret, sock_strerror(sock_errno) );
 
-                        Mutex_lock( &Struct_mutex );
-                        ses = SP_get_session( mbox );
-                        if( ses < 0 ){
-                            Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                            Mutex_unlock( &Struct_mutex );
-                            Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                            return( CONNECTION_CLOSED );
-                        }
-                        Sessions[ses].state = SESS_ERROR;
-                        Mutex_unlock( &Struct_mutex );
+			Mutex_lock( &Struct_mutex );
+			ses = SP_get_session( mbox );
+			if( ses < 0 ){
+				Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+				Mutex_unlock( &Struct_mutex );
+				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+				return( CONNECTION_CLOSED );
+			}
+			Sessions[ses].state = SESS_ERROR;
+			Mutex_unlock( &Struct_mutex );
 
 			Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 			return( CONNECTION_CLOSED );
@@ -1596,29 +1598,29 @@ static	char		dummy_buf[10240];
 		}
 	}
 
- 	if( Is_reg_memb_mess( head_ptr->type ) && !Same_endian( head_ptr->type ) )
+	if( Is_reg_memb_mess( head_ptr->type ) && !Same_endian( head_ptr->type ) )
 	{
-		int	 	flip_size;
-		group_id	*gid_ptr;
-                int32u          *num_vs_sets_ptr;
-                int32u           num_vs_sets;
-                int32u          *local_vs_set_offset_ptr;
-		int32u		*num_vs_ptr;
-		int		bytes_to_copy, bytes_index;
-		char		groups_buf[10240];
-                int             num_bytes;
-                int             j;
-                int             total_index; /* Index into the scatters viewed as a contiguous byte array */
-                int             target_index;/* Goal for total index */
-                int             scat;        /* The current scatter element */
-                int             scat_index=0;/* Index into the current scatter element */
-                int             first_scat;       /* The first scatter element used for a given num_vs */
-                int             first_scat_index; /* Index into the first scatter element for a given num_vs */
+		int       flip_size;
+		group_id *gid_ptr;
+		int32u   *num_vs_sets_ptr;
+		int32u    num_vs_sets;
+		int32u   *local_vs_set_offset_ptr;
+		int32u   *num_vs_ptr;
+		int       bytes_to_copy, bytes_index;
+		char      groups_buf[10240];
+		int       num_bytes;
+		int       j;
+		int       total_index;  /* Index into the scatters viewed as a contiguous byte array */
+		int       target_index; /* Goal for total index */
+		int       scat;         /* The current scatter element */
+		int       scat_index = 0; /* Index into the current scatter element */
+		int       first_scat;   /* The first scatter element used for a given num_vs */
+		int       first_scat_index; /* Index into the first scatter element for a given num_vs */
 
 		/* 
 		 * flip membership message:
 		 * group_id, number of vs_sets, offset to local,
-                 * and number of members in vs_sets (for each set)
+		 * and number of members in vs_sets (for each set)
 		 * so - acctually 5+n int32.
 		 */
 		flip_size = sizeof( group_id ) + 2*sizeof( int32u );
@@ -1629,31 +1631,31 @@ static	char		dummy_buf[10240];
 			if( bytes_to_copy > scat_mess->elements[scat].len )
 				bytes_to_copy = scat_mess->elements[scat].len;
 			memcpy( &groups_buf[bytes_index], scat_mess->elements[scat].buf, bytes_to_copy );
-                        if( bytes_to_copy == scat_mess->elements[scat].len )
-                        {
-                                scat_index = 0;
-                                ++scat;
-                        } else {
-                                scat_index = bytes_to_copy;
-                        }
+			if( bytes_to_copy == scat_mess->elements[scat].len )
+			{
+				scat_index = 0;
+				++scat;
+			} else {
+				scat_index = bytes_to_copy;
+			}
 		}
-                total_index  = flip_size;
-                target_index = total_index;
+		total_index  = flip_size;
+		target_index = total_index;
 
-                num_bytes               = 0;
+		num_bytes               = 0;
 		gid_ptr                 = (group_id *)&groups_buf[num_bytes];
-                num_bytes              += sizeof(group_id);
-                num_vs_sets_ptr         = (int32u *)&groups_buf[num_bytes];
-                num_bytes              += sizeof(int32u);
-                local_vs_set_offset_ptr = (int32u *)&groups_buf[num_bytes];
-                num_bytes              += sizeof(int32u);
+		num_bytes              += sizeof(group_id);
+		num_vs_sets_ptr         = (int32u *)&groups_buf[num_bytes];
+		num_bytes              += sizeof(int32u);
+		local_vs_set_offset_ptr = (int32u *)&groups_buf[num_bytes];
+		num_bytes              += sizeof(int32u);
                 
 		gid_ptr->memb_id.proc_id = Flip_int32( gid_ptr->memb_id.proc_id );
 		gid_ptr->memb_id.time    = Flip_int32( gid_ptr->memb_id.time );
 		gid_ptr->index           = Flip_int32( gid_ptr->index );
-                *num_vs_sets_ptr         = Flip_int32( *num_vs_sets_ptr );
-                num_vs_sets              = *num_vs_sets_ptr;
-                *local_vs_set_offset_ptr = Flip_int32( *local_vs_set_offset_ptr );
+		*num_vs_sets_ptr         = Flip_int32( *num_vs_sets_ptr );
+		num_vs_sets              = *num_vs_sets_ptr;
+		*local_vs_set_offset_ptr = Flip_int32( *local_vs_set_offset_ptr );
 
 		for( bytes_index = 0, j = 0 ; bytes_index < flip_size ; j++, bytes_index += bytes_to_copy )
 		{
@@ -1662,64 +1664,64 @@ static	char		dummy_buf[10240];
 				bytes_to_copy = scat_mess->elements[j].len;
 			memcpy( scat_mess->elements[j].buf, &groups_buf[bytes_index], bytes_to_copy );
 		}
-                for( i = 0; i < num_vs_sets; ++i )
-                {
-                        while( total_index < target_index )
-                        {
-                                if( target_index - total_index < scat_mess->elements[scat].len - scat_index )
-                                {
-                                        scat_index  += target_index - total_index;
-                                        total_index  = target_index;
-                                } else {
-                                        total_index += scat_mess->elements[scat].len - scat_index;
-                                        scat_index   = 0;
-                                        ++scat;
-                                }
-                        }
-                        first_scat_index = scat_index;
-                        first_scat       = scat;
+		for( i = 0; i < num_vs_sets; ++i )
+		{
+			while( total_index < target_index )
+			{
+				if( target_index - total_index < scat_mess->elements[scat].len - scat_index )
+				{
+					scat_index  += target_index - total_index;
+					total_index  = target_index;
+				} else {
+					total_index += scat_mess->elements[scat].len - scat_index;
+					scat_index   = 0;
+					++scat;
+				}
+			}
+			first_scat_index = scat_index;
+			first_scat       = scat;
 
-                        flip_size = sizeof( int32u );
-                        if( flip_size + total_index > max_mess_len ) flip_size = max_mess_len - total_index;
-                        for( bytes_index = 0 ; bytes_index < flip_size ; bytes_index += bytes_to_copy )
-                        {
-                                bytes_to_copy = flip_size - bytes_index;
-                                if( bytes_to_copy > scat_mess->elements[scat].len - scat_index )
-                                        bytes_to_copy = scat_mess->elements[scat].len - scat_index;
-                                memcpy( &groups_buf[bytes_index], &(scat_mess->elements[scat].buf[scat_index]),
-                                        bytes_to_copy );
-                                if( bytes_to_copy == scat_mess->elements[scat].len - scat_index )
-                                {
-                                        scat_index = 0;
-                                        ++scat;
-                                } else {
-                                        scat_index += bytes_to_copy;
-                                }
-                        }
-                        total_index += flip_size;
-                        target_index = total_index;
+			flip_size = sizeof( int32u );
+			if( flip_size + total_index > max_mess_len ) flip_size = max_mess_len - total_index;
+			for( bytes_index = 0 ; bytes_index < flip_size ; bytes_index += bytes_to_copy )
+			{
+				bytes_to_copy = flip_size - bytes_index;
+				if( bytes_to_copy > scat_mess->elements[scat].len - scat_index )
+					bytes_to_copy = scat_mess->elements[scat].len - scat_index;
+				memcpy( &groups_buf[bytes_index], &(scat_mess->elements[scat].buf[scat_index]),
+				        bytes_to_copy );
+				if( bytes_to_copy == scat_mess->elements[scat].len - scat_index )
+				{
+					scat_index = 0;
+					++scat;
+				} else {
+					scat_index += bytes_to_copy;
+				}
+			}
+			total_index += flip_size;
+			target_index = total_index;
 
-                        num_vs_ptr  = (int32u *)&groups_buf[0];
-                        *num_vs_ptr = Flip_int32( *num_vs_ptr );
+			num_vs_ptr  = (int32u *)&groups_buf[0];
+			*num_vs_ptr = Flip_int32( *num_vs_ptr );
 
-                        for( bytes_index = 0, j = first_scat ; bytes_index < flip_size ;
-                             j++, bytes_index += bytes_to_copy )
-                        {
-                                bytes_to_copy = flip_size - bytes_index;
-                                if( bytes_to_copy > scat_mess->elements[j].len - first_scat_index )
-                                        bytes_to_copy = scat_mess->elements[j].len - first_scat_index;
-                                memcpy( &(scat_mess->elements[j].buf[first_scat_index]),
-                                        &groups_buf[bytes_index], bytes_to_copy );
-                                first_scat_index = 0;
-                        }
-                        target_index += *num_vs_ptr * MAX_GROUP_NAME;
-                }
+			for( bytes_index = 0, j = first_scat ; bytes_index < flip_size ;
+			     j++, bytes_index += bytes_to_copy )
+			{
+				bytes_to_copy = flip_size - bytes_index;
+				if( bytes_to_copy > scat_mess->elements[j].len - first_scat_index )
+					bytes_to_copy = scat_mess->elements[j].len - first_scat_index;
+				memcpy( &(scat_mess->elements[j].buf[first_scat_index]),
+				        &groups_buf[bytes_index], bytes_to_copy );
+				first_scat_index = 0;
+			}
+			target_index += *num_vs_ptr * MAX_GROUP_NAME;
+		}
 	}
-        if ( Is_reject_mess( head_ptr->type ) )
-        {
-                /* set type to be old type + reject */
-                head_ptr->type = old_type | REJECT_MESS;
-        }
+	if ( Is_reject_mess( head_ptr->type ) )
+	{
+		/* set type to be old type + reject */
+		head_ptr->type = old_type | REJECT_MESS;
+	}
 	*service_type = Clear_endian( head_ptr->type );
 
 	if( short_buffer )
@@ -1729,22 +1731,22 @@ static	char		dummy_buf[10240];
 			to_read = remain;
 			if( to_read > sizeof( dummy_buf ) ) to_read = sizeof( dummy_buf );
 			while(((ret = recv( mbox, dummy_buf, to_read, 0 )) == -1 ) && ((sock_errno == EINTR) || (sock_errno == EAGAIN) || (sock_errno == EWOULDBLOCK)) )
-                                ;
+			{};
 			if( ret <=0 )
 			{
 				Alarm( SESSION, "SP_scat_receive: failed receiving overflow on session %d, ret is %d: %s\n", 
-                                       mbox, ret, sock_strerror(sock_errno) );
+				       mbox, ret, sock_strerror(sock_errno) );
 
-                                Mutex_lock( &Struct_mutex );
-                                ses = SP_get_session( mbox );
-                                if( ses < 0 ){
-                                    Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
-                                    Mutex_unlock( &Struct_mutex );
-                                    Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                                    return( CONNECTION_CLOSED );
-                                }
-                                Sessions[ses].state = SESS_ERROR;
-                                Mutex_unlock( &Struct_mutex );
+				Mutex_lock( &Struct_mutex );
+				ses = SP_get_session( mbox );
+				if( ses < 0 ){
+					Alarmp( SPLOG_INFO, SESSION, "SP_scat_receive: Session disappeared on us, possible in threaded apps\n");
+					Mutex_unlock( &Struct_mutex );
+					Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+					return( CONNECTION_CLOSED );
+				}
+				Sessions[ses].state = SESS_ERROR;
+				Mutex_unlock( &Struct_mutex );
 
 				Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 				return( CONNECTION_CLOSED );
@@ -1753,19 +1755,19 @@ static	char		dummy_buf[10240];
 		Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 		return( BUFFER_TOO_SHORT );
 	}
-        /* Successful receive so clear saved_message info if any */
-        if (This_session_message_saved) {
-                Mutex_lock( &Struct_mutex );
-                ses = SP_get_session( mbox );
-                if( ses < 0 ){
-                        Mutex_unlock( &Struct_mutex );
-                        Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
-                        return( ILLEGAL_SESSION );
-                }
-                memset(&(Sessions[ses].recv_saved_head), 0, sizeof(message_header) );
-                Sessions[ses].recv_message_saved = 0;
-                Mutex_unlock( &Struct_mutex );
-        }
+	/* Successful receive so clear saved_message info if any */
+	if (This_session_message_saved) {
+		Mutex_lock( &Struct_mutex );
+		ses = SP_get_session( mbox );
+		if( ses < 0 ){
+			Mutex_unlock( &Struct_mutex );
+			Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
+			return( ILLEGAL_SESSION );
+		}
+		memset(&(Sessions[ses].recv_saved_head), 0, sizeof(message_header) );
+		Sessions[ses].recv_message_saved = 0;
+		Mutex_unlock( &Struct_mutex );
+	}
 
 	Mutex_unlock( &Mbox_mutex[mbox & MAX_MUTEX_MASK][1] );
 	return( head_ptr->data_len );
