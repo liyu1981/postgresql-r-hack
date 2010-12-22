@@ -989,8 +989,9 @@ CoordinatorMain(int argc, char *argv[])
 		if (socket_ready)
 		{
 #ifdef REPLICATION
-			if (replication_enabled)
+			if (replication_enabled) {
 				coordinator_replication_check_sockets(&socks);
+			}
 #endif
 		}
 

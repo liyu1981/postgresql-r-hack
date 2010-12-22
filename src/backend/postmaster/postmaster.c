@@ -2687,7 +2687,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 			 */
 			if (!FatalError)
 			{
-				ereport(DEBUG2,
+				ereport(DEBUG1,
 						(errmsg_internal("sending %s to process %d",
 										 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 										 (int) bp->pid)));
@@ -2701,7 +2701,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		StartupPID = 0;
 	else if (StartupPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 								 (int) StartupPID)));
@@ -2713,7 +2713,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		BgWriterPID = 0;
 	else if (BgWriterPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 								 (int) BgWriterPID)));
@@ -2725,7 +2725,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		WalWriterPID = 0;
 	else if (WalWriterPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 								 (int) WalWriterPID)));
@@ -2737,7 +2737,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		WalReceiverPID = 0;
 	else if (WalReceiverPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 								 (int) WalReceiverPID)));
@@ -2749,7 +2749,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		CoordinatorPID = 0;
 	else if (CoordinatorPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 								 (int) CoordinatorPID)));
@@ -2764,7 +2764,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	 */
 	if (PgArchPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 "SIGQUIT",
 								 (int) PgArchPID)));
@@ -2779,7 +2779,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	 */
 	if (PgStatPID != 0 && !FatalError)
 	{
-		ereport(DEBUG2,
+		ereport(DEBUG1,
 				(errmsg_internal("sending %s to process %d",
 								 "SIGQUIT",
 								 (int) PgStatPID)));

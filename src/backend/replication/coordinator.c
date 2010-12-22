@@ -730,10 +730,10 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 		{
 #ifdef COORDINATOR_DEBUG
 			if (msg_type == IMSGT_SEQ_INCREMENT)
-				elog(DEBUG1, "Coordinator: requested increment of sequence %s",
+				elog(DEBUG2, "Coordinator: requested increment of sequence %s",
 					 seqname);
 			else
-				elog(DEBUG1, "Coordiantor: requested setval on sequence %s",
+				elog(DEBUG2, "Coordiantor: requested setval on sequence %s",
 					 seqname);
 #endif
 
@@ -922,7 +922,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 		if (group->gcsi->funcs.is_local(group, sender_node))
 		{
 #ifdef COORDINATOR_DEBUG
-		    elog(DEBUG1, "Coordinator: ignoring IMSGT_CSET from local node.");
+		    elog(DEBUG2, "Coordinator: ignoring IMSGT_CSET from local node.");
 #endif
 			return;
 		}
