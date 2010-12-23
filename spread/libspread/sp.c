@@ -1271,6 +1271,10 @@ int	SP_scat_receive( mailbox mbox, service *service_type, char sender[MAX_GROUP_
 		/* read up to size of message_header */
 		for( len=0, remain = sizeof(message_header); remain > 0;  len += ret, remain -= ret )
 		{
+			/* liyu: spread will go into endless loop here, to receive
+			   a msg what if a partial msg has arrived? Which could
+			   cause a disaster to user :(
+			 */
 			while(((ret = recv( mbox, &buf_ptr[len], remain, 0 )) == -1 )
 			      && ((sock_errno == EINTR) || 
 			          (sock_errno == EAGAIN) || 
