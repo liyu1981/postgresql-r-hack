@@ -658,6 +658,7 @@ CoordinatorMain(int argc, char *argv[])
 	sigjmp_buf	local_sigjmp_buf;
 	IMessage   *msg = NULL;
 	bool        can_launch;
+	int         ret;
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
@@ -901,17 +902,21 @@ CoordinatorMain(int argc, char *argv[])
 		if (!got_SIGTERM && !got_SIGUSR2 && !got_SIGHUP)
 		{
 			sigemptyset(&sigmask);
-			if (pselect(max_sock_id + 1, &socks, NULL, NULL, &nap,
-						&sigmask) < 0)
+			ret = pselect(max_sock_id + 1, &socks, NULL, NULL, &nap, &sigmask);
+			if (ret < 0)
 			{
 				if (errno != EINTR)
 				{
 					elog(WARNING, "Coordinator: pselect failed: %m");
-					socket_ready = true;
+					socket_ready = false;
 				}
 			}
-			else
-				socket_ready = true;
+			else {
+				if (ret > 0)
+					socket_ready = true;
+				else /* ret == 0 */
+					socket_ready = false;
+			}
 		}
 
 		sigprocmask(SIG_SETMASK, &oldmask, NULL);
