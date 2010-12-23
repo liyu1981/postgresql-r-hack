@@ -39,7 +39,17 @@
 #define MAX_MEMBERS      100
 #define MAX_VSSETS       100
 
-#define GC_SPREAD_LOCAL_SOCKET 4804
+#define SPREAD_RECV_TIME_OUT 10 /* seconds */
+
+/* Macro timeout call. It will call expression e, wait at most time t,
+ * and call handler h when time expires */
+#define SPREAD_TIMEOUT_CALL(t, e, h) \
+	{ \
+	    sighandler_t old_handler = signal(SIGALRM, (h)); \
+	    alarm((t)); \
+	    (e); \
+	    signal(SIGALRM, old_handler); \
+	}
 
 typedef struct
 {
@@ -121,6 +131,7 @@ void spread_get_node_desc(const gcs_group *group, group_node const *node, char *
 
 /* private methods */
 uint32 pgn2id(const char *name);
+void spread_recv_timeout_handler(int signum);
 void spread_group_check_members(const gcs_info *gcsi,
                                 gcs_group *group,
                                 int memb_size, char memb_names[][MAX_GROUP_NAME]);
@@ -325,6 +336,8 @@ spread_connect(gcs_info *gcsi)
 void
 spread_disconnect(gcs_info *gcsi)
 {
+	if (gcsi->groups)
+		hash_destroy(gcsi->groups);
 	SP_disconnect(GC_DATA(gcsi)->mbox);
 	pfree(gcsi->data);
 }
@@ -496,6 +509,12 @@ spread_set_socks(const gcs_info *gcsi, fd_set *socks, int *max_socks)
 }
 
 void
+spread_recv_timeout_handler(int signum)
+{
+	elog(ERROR, "GC Layer: spread recv takes too long to respond, must be dead. Re-start coordinator now!");
+}
+
+void
 spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 {
 	int              err;
@@ -515,7 +534,10 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	spread_data *sp_data = GC_DATA(gcsi);
 //#endif
 
-	spread_recv(gcsi);
+	/* liyu: sometimes the spread will be messed, died when receive
+	 * msg, but it blocks our application and makes the whole pg
+	 * stuck. So here we turn to a timed-out solution */
+	SPREAD_TIMEOUT_CALL(SPREAD_RECV_TIME_OUT, spread_recv(gcsi), spread_recv_timeout_handler);
 
 	if((GC_DATA(gcsi)->recv_flag))
 	{
