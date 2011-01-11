@@ -12,8 +12,10 @@
  */
 
 #include <signal.h>
-#include <unistd.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -61,9 +63,6 @@ typedef struct
                       * postmaster/coordinator.c:847, it is used to
                       * wake the coordinator_handle_gc_message
                       * there */
-	pthread_t        recv_thread;
-	pthread_cond_t   recv_thread_cond;
-	pthread_mutex_t  recv_thread_mutex; /* currently not used */
 
 	/* receive related stuff */
 	bool   recv_flag;
@@ -171,13 +170,6 @@ spread_init(gcs_info *gcsi, char **params)
 	{
 		if(&GC_DATA(gcsi)->recv_buffer)
 			pfree(&GC_DATA(gcsi)->recv_buffer);
-		if(GC_DATA(gcsi)->recv_thread)
-		{
-			/* force the thread to terminate */
-			pthread_kill(GC_DATA(gcsi)->recv_thread, 9);
-			pthread_mutex_destroy(&GC_DATA(gcsi)->recv_thread_mutex);
-			pthread_cond_destroy(&GC_DATA(gcsi)->recv_thread_cond);
-		}
 		pfree(gcsi->data);
 	}
 
@@ -186,7 +178,6 @@ spread_init(gcs_info *gcsi, char **params)
 	            RECV_BUFFER_SIZE);
 	RESET_GCSI_NAMES(gcsi);
 	GC_DATA(gcsi)->recv_flag = false; /* init the recv flag */
-	GC_DATA(gcsi)->recv_thread = NULL;
 
 	gc_init_groups_hash(gcsi);
 
@@ -534,10 +525,12 @@ spread_handle_message(gcs_info *gcsi, const fd_set *socks)
 	spread_data *sp_data = GC_DATA(gcsi);
 //#endif
 
-	/* liyu: sometimes the spread will be messed, died when receive
-	 * msg, but it blocks our application and makes the whole pg
-	 * stuck. So here we turn to a timed-out solution */
-	SPREAD_TIMEOUT_CALL(SPREAD_RECV_TIME_OUT, spread_recv(gcsi), spread_recv_timeout_handler);
+	if(FD_ISSET(GC_DATA(gcsi)->mbox, socks) != 0) {
+		/* liyu: sometimes the spread will be messed, died when receive
+		 * msg, but it blocks our application and makes the whole pg
+		 * stuck. So here we turn to a timed-out solution */
+		SPREAD_TIMEOUT_CALL(SPREAD_RECV_TIME_OUT, spread_recv(gcsi), spread_recv_timeout_handler);
+	}
 
 	if((GC_DATA(gcsi)->recv_flag))
 	{
