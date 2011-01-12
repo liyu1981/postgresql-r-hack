@@ -600,12 +600,15 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 #ifdef COORDINATOR_DEBUG
 	group->gcsi->funcs.get_node_desc(group, sender_node, node_desc);
-    elog(DEBUG3,
+    elog(DEBUG1,
 		 "Coordinator: received message %s\n"
 		 "             for database %d\n"
 		 "             from node %s of size %d",
 	 	 decode_imessage_type(msg_type), group->dboid,
-		 node_desc, msg_size + 1);
+         node_desc, msg_size + 1);
+         //"", msg_size + 1);
+
+    REPLICATION_PRINT_MEMORY(start_of_msg, msg_size, FALSE);
 #endif
 
 	if (msg_type == IMSGT_DB_STATE)
