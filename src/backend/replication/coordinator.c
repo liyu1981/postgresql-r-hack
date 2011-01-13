@@ -600,7 +600,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 #ifdef COORDINATOR_DEBUG
 	group->gcsi->funcs.get_node_desc(group, sender_node, node_desc);
-    elog(DEBUG1,
+    elog(DEBUG3,
 		 "Coordinator: received message %s\n"
 		 "             for database %d\n"
 		 "             from node %s of size %d",
@@ -622,7 +622,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 #ifdef COORDINATOR_DEBUG
 		group->gcsi->funcs.get_node_desc(group, sender_node, node_desc);
-		elog(DEBUG1,
+		elog(DEBUG3,
 			 "Coordinator: node %s changed from %s to %s",
 			 node_desc, decode_database_state(sender_node->state),
 			 decode_database_state(new_state));
@@ -815,7 +815,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 		if (group->db_state == RDBS_OPERATING)
 		{
-		    elog(DEBUG1, "Coordinator:     commit for database %d, count csets: %d, coid: %d",
+		    elog(DEBUG3, "Coordinator:     commit for database %d, count csets: %d, coid: %d",
 				 group->dboid, count_csets, coid);
 
 			/*
@@ -941,14 +941,14 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 
 		if (xi->aborted)
 		{
-		    elog(DEBUG1, "Coordinator:     node %d / xid %d: changeset %d for database %d ignored, transaction already aborted",
+		    elog(DEBUG3, "Coordinator:     node %d / xid %d: changeset %d for database %d ignored, transaction already aborted",
 				 sender_node->id, origin_xid, cset_no, group->dboid);
 		}
 		else if (group->db_state == RDBS_OPERATING)
 		{
-		    elog(DEBUG1, "Coordinator:     changeset %d for database %d",
+		    elog(DEBUG3, "Coordinator:     changeset %d for database %d",
 				 cset_no, group->dboid);
-			elog(DEBUG1, "Coordinator:     based on snapshot: %d/%d",
+			elog(DEBUG3, "Coordinator:     based on snapshot: %d/%d",
 				 snap_node, snap_xid);
 
 			LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED);
