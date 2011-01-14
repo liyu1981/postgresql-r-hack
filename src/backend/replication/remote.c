@@ -162,7 +162,7 @@ cset_parse_open_statement(CsetCmdType type)
 	csi->localRelOid = get_relname_relid(relname, nspoid);
 	if(!OidIsValid(csi->localRelOid))
 		elog(ERROR, "bg worker [%d/%d]: relation '%s' doesn't exist",
-			 MyProcPid, MyBackendId, relname);
+		     MyProcPid, MyBackendId, relname);
 
 
 	/*
@@ -256,6 +256,9 @@ cset_process(EState *estate)
 			case CSCMD_INSERT:
 			case CSCMD_UPDATE:
 			case CSCMD_DELETE:
+#ifdef COORDINATOR_DEBUG
+				REPLICATION_PRINT_MEMORY((char*)(reader->buf.data), reader->msg->size, TRUE);
+#endif
 				cset_parse_open_statement(cmd_type);
 				break;
 

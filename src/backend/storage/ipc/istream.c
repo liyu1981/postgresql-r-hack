@@ -73,7 +73,6 @@ await_imessage()
 	return msg;
 }
 
-
 static void
 istream_prepare_for_reading(IStreamReader reader, int size)
 {
@@ -100,9 +99,9 @@ istream_prepare_for_reading(IStreamReader reader, int size)
 
 		/* FIXME: wait should be able to time out or something */
 		reader->msg = await_imessage();
+		Assert(reader->msg);
 
 		/* FIXME: error detection */
-		Assert(reader->msg);
 		if (reader->msg->type != reader->msg_type)
 			elog(WARNING, "bg worker [%d/%d]: unexpected message type: %s",
 				 MyProcPid, MyBackendId,
@@ -156,6 +155,7 @@ istream_read_data(IStreamReader reader, void *ptr, int size)
 
 	while (size > 0)
 	{
+#ifdef USE_ASSERT_CHECKING
 		/* prepare for reading at least one byte */
 		istream_prepare_for_reading(reader, 5);
 
@@ -164,6 +164,10 @@ istream_read_data(IStreamReader reader, void *ptr, int size)
 		 * still required by the specified data size.
 		 */
 		avail = get_bytes_read(b) - 4;
+#else
+		istream_prepare_for_reading(reader, 1);
+		avail = get_bytes_read(b);
+#endif
 		if (size < avail)
 			avail = size;
 
@@ -175,8 +179,13 @@ istream_read_data(IStreamReader reader, void *ptr, int size)
 			elog(DEBUG5, "bg worker [%d/%d]: istream: got data of size %d (remaining %d)",
 				 MyProcPid, MyBackendId, avail, size);
 
+#ifdef USE_ASSERT_CHECKING
+		/* liyu: the attached string size will only be double checked
+		 * which is set by istream_write_data. This should be DEBUG
+		 * only. */
 		Assert(get_int32(b) == size);
 		Assert((get_bytes_read(b) == 0) || (size == 0));
+#endif
 	}
 }
 
@@ -287,11 +296,16 @@ istream_write_data(IStreamWriter writer, const void *ptr, int size)
 
 	while (size > 0)
 	{
+#ifdef USE_ASSERT_CHECKING
 		/* prepare for writing at least one byte */
 		istream_prepare_for_writing(writer, 5);
 
 		/* fill the current buffer (i.e. message) */
 		avail = b->max_size - b->ptr - 4;
+#else
+		istream_prepare_for_writing(writer, 1);
+		avail = b->max_size - b->ptr;
+#endif
 		if (size < avail)
 			avail = size;
 
@@ -303,8 +317,13 @@ istream_write_data(IStreamWriter writer, const void *ptr, int size)
 			elog(DEBUG5, "bg worker [%d/%d]: istream: put data of size %d (remaining %d)",
 				 MyProcPid, MyBackendId, avail, size);
 
+#ifdef USE_ASSERT_CHECKING
+		/* liyu: the attached string size will only be double checked
+		 * when istream_read_data. This should be DEBUG only, so wrap
+		 * it by Assert. */
 		put_int32(b, size);
 		Assert((b->max_size == b->ptr) || (size == 0));
+#endif
 	}
 }
 

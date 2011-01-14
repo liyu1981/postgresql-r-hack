@@ -14,7 +14,10 @@
 #include "storage/pg_shmem.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
-
+#define WAMALLOC_USE_LWLOCK
+#ifdef WAMALLOC_USE_LWLOCK
+#include "storage/lwlock.h"
+#endif
 
 /*
  * The number of sizeclasses and heaps (per sizeclass) to partition the
@@ -239,6 +242,9 @@ wam_partial_list_push(t_sizeclass_ptr sc, t_desc_ptr desc)
 	Assert(desc->magic == MAGIC_VALUE);
 #endif
 
+	Assert(desc->Anchor.count > 0);
+	Assert(desc->Anchor.count < desc->maxcount);
+
 	desc->next = sc->partial_desc_list;
 	sc->partial_desc_list = desc;
 }
@@ -441,17 +447,27 @@ wam_alloc(size_t sz)
 
 	START_CRIT_SECTION();
 	{
+#ifdef WAMALLOC_USE_LWLOCK
+		LWLockAcquire(DynShmemAllocLock, LW_EXCLUSIVE);
+#endif
+
 		addr = wam_alloc_from_partial(heap);
 		if (!addr)
 			addr = wam_alloc_from_sblock(heap);
+
+#ifdef WAMALLOC_USE_LWLOCK
+		LWLockRelease(DynShmemAllocLock);
+#endif
 	}
 	END_CRIT_SECTION();
 
 #ifdef MAGIC
-	*((MAGIC_TYPE*) addr) = MAGIC_VALUE;
-	*((MAGIC_TYPE*) (addr + heap->sc->sz - sizeof(Pointer)
-						  - sizeof(MAGIC_TYPE))) = MAGIC_VALUE;
-	addr += sizeof(MAGIC_TYPE);
+	if (addr) {
+		*((MAGIC_TYPE*) addr) = MAGIC_VALUE;
+		*((MAGIC_TYPE*) (addr + heap->sc->sz - sizeof(Pointer)
+		                                     - sizeof(MAGIC_TYPE))) = MAGIC_VALUE;
+		addr += sizeof(MAGIC_TYPE);
+	}
 #endif
 
 	if (!addr)
@@ -487,6 +503,10 @@ wam_free(void* ptr)
 
 	START_CRIT_SECTION();
 	{
+#ifdef WAMALLOC_USE_LWLOCK
+		LWLockAcquire(DynShmemAllocLock, LW_EXCLUSIVE);
+#endif
+
 		SpinLockAcquire(&desc->DescLock);
 
 #ifdef MAGIC
@@ -514,6 +534,9 @@ wam_free(void* ptr)
         {
 			heap = desc->heap;
 
+			if (oldanchor.state == STATE_FULL)
+				Assert(desc->Anchor.count == 0);
+
             desc->Anchor.avail = (addr - (Pointer) desc->sb) / desc->sz;
 			Assert(desc->Anchor.avail < desc->maxcount);
             desc->Anchor.count++;
@@ -533,14 +556,20 @@ wam_free(void* ptr)
 			wam_free_sblock(freeable_sb);
 			SpinLockRelease(&ctl->WamLock);
 		}
-		else if (oldanchor.state == STATE_FULL)
+		else if (oldanchor.state == STATE_FULL &&
+			     desc != heap->Active)
 		{
 			Assert(heap != NULL);
+			Assert(anchor.state == STATE_PARTIAL);
 
 			SpinLockAcquire(&ctl->WamLock);
 			wam_partial_list_push(heap->sc, desc);
 			SpinLockRelease(&ctl->WamLock);
 		}
+
+#ifdef WAMALLOC_USE_LWLOCK
+		LWLockRelease(DynShmemAllocLock);
+#endif
 	}
 	END_CRIT_SECTION();
 }
@@ -607,6 +636,10 @@ wam_init()
 	if (found)
 		return;
 
+#ifdef WAMALLOC_USE_LWLOCK
+	LWLockAcquire(DynShmemAllocLock, LW_EXCLUSIVE);
+#endif
+
 	ctl = (t_control_ptr) ptr;
 	ptr += sizeof(struct t_wam_control);
 	ptr = ALIGN_POINTER(ptr);
@@ -664,15 +697,18 @@ wam_init()
 	ctl->SuperblockAvail = NULL;
 	while ((ptr - shmem) < (size - SUPERBLOCK_SIZE))
 	{
-		sb = (t_superblock_ptr) ptr;
-		ptr += SUPERBLOCK_SIZE;
-
 		Assert(IS_ALIGNED(ptr));
+
+		sb = (t_superblock_ptr) ptr;
 
 		/* push onto the stack */
 		sb->next = ctl->SuperblockAvail;
 		ctl->SuperblockAvail = sb;
 
-		i++;
+		ptr += SUPERBLOCK_SIZE;
 	}
+
+#ifdef WAMALLOC_USE_LWLOCK
+	LWLockRelease(DynShmemAllocLock);
+#endif
 }

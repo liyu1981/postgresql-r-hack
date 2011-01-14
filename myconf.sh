@@ -63,7 +63,7 @@ then
 	usage
 fi
 
-while getopts d:r opt
+while getopts d:rps opt
 do
 	case "$opt" in
 		d) install_prefix="$OPTARG";;

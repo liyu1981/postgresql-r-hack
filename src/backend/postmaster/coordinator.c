@@ -1061,12 +1061,12 @@ handle_imessage(IMessage *msg)
 
 #ifdef COORDINATOR_DEBUG
 	if (proc)
-		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(connected to db %d, local xid %d)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender,
 			 dboid, local_xid);
 	else
-		elog(DEBUG3, "Coordinator: received %s of size %d from backend %d\n"
+		elog(DEBUG1, "Coordinator: received %s of size %d from backend %d\n"
 			 "\t(for which no PGPROC could be found)",
 			 decode_imessage_type(msg->type), msg->size, msg_sender);
 #endif
@@ -2069,15 +2069,17 @@ BackgroundWorkerMain(int argc, char *argv[])
 		while ((msg = IMessageCheck()) && !terminate_worker)
 		{
 #ifdef COORDINATOR_DEBUG
-			ereport(DEBUG3,
-					(errmsg("bg worker [%d/%d]: received message %s of size %d "
-							"from backend id %d, db %d, state: %s",
+			ereport(DEBUG1,
+					(errmsg("bg worker [%d/%d]: received message %s of size %d \n"
+							"                   from backend id %d, db %d, state: %s",
 							MyProcPid, MyBackendId,
 							decode_imessage_type(msg->type),
 							msg->size, msg->sender,
 							MyDatabaseId,
 							decode_database_state(
 								get_db_replication_state(MyDatabaseId)))));
+
+			REPLICATION_PRINT_MEMORY(IMSG_DATA(msg), msg->size, FALSE);
 #endif
 
 			switch (msg->type)
