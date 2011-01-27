@@ -2390,6 +2390,11 @@ StartTransactionCommand(void)
 {
 	TransactionState s = CurrentTransactionState;
 
+#ifdef REPLICATION
+	if (s->blockState != TBLOCK_DEFAULT)
+		goto clear_and_exit;
+#endif
+
 	switch (s->blockState)
 	{
 			/*
@@ -2442,6 +2447,9 @@ StartTransactionCommand(void)
 			break;
 	}
 
+#ifdef REPLICATION
+clear_and_exit:
+#endif
 	/*
 	 * We must switch to CurTransactionContext before returning. This is
 	 * already done if we called StartTransaction, otherwise not.
