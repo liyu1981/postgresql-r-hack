@@ -1333,7 +1333,8 @@ continue_scan:
 				 * PGR, since not far from here, there is a
 				 * Assert(false) when result = HeapTupleSelfUpdated.
 				 */
-				if (result != HeapTupleMayBeUpdated)
+				if (result != HeapTupleMayBeUpdated &&
+					result != HeapTupleSelfUpdated)
 				{
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 					ReleaseBuffer(buffer);
