@@ -1286,10 +1286,16 @@ retry_tuple:
 			 * (re)initialize the index scanner which scans for pre-existing
 			 * tuples with these primary key values.
 			 */
-			if (!csi->iscan)
+			if (!csi->iscan) {
+				/*
+				for(i = 0; i< idx_rel->rd_index->indnatts; ++i) {
+					elog(LOG, "[relation %d] skeys[%d]: %d\n", csi->base_rel->rd_id, i, skeys[i].sk_argument);
+				}
+				*/
 				csi->iscan = index_beginscan(csi->base_rel, idx_rel,
 											 estate->es_snapshot, numKeys,
 											 skeys);
+			}
 			else
 				index_rescan(csi->iscan, skeys);	
 
