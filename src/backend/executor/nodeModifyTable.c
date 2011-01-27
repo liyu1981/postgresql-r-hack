@@ -1323,6 +1323,16 @@ continue_scan:
 				 * Immediately release the buffer again, if we may not
 				 * update the tuple.
 				 */
+				/* liyu: when there are more than one update statement
+				 * in on transaction, the result will be returned as
+				 * HeapTupleSelfUpdated, which is a scenario we are safe to update
+				 * again, and no reason that we should release the buffer lock (later
+				 * heap_*_internal function will do it.)
+				 *
+				 * This should be a un-planned feature currently in
+				 * PGR, since not far from here, there is a
+				 * Assert(false) when result = HeapTupleSelfUpdated.
+				 */
 				if (result != HeapTupleMayBeUpdated)
 				{
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
