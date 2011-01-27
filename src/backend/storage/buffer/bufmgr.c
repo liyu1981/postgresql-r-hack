@@ -2332,7 +2332,7 @@ LockBuffer(Buffer buffer, int mode)
 		return;					/* local buffers need no lock */
 
 	buf = &(BufferDescriptors[buffer - 1]);
-
+	
 	if (mode == BUFFER_LOCK_UNLOCK)
 		LWLockRelease(buf->content_lock);
 	else if (mode == BUFFER_LOCK_SHARE)
