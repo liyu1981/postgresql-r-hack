@@ -573,7 +573,6 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 			if ((pte[i].origin_node_id != InvalidNodeId) &&
 				(pte[i].local_xid == local_xid))
 			{
-				elog(LOG, "found eff_coid: origin_node_id=%d, origin_xid=%d, local_xid=%d, local_coid=%d", pte[i].origin_node_id, pte[i].origin_xid, pte[i].local_xid, pte[i].local_coid);
 				*eff_coid = pte[i].local_coid;
 				if (found_req_coid)
 					break;
@@ -583,7 +582,6 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 			if ((pte[i].origin_node_id == origin_node_id) &&
 				(pte[i].origin_xid == origin_xid))
 			{
-				elog(LOG, "found req_coid: origin_node_id=%d, origin_xid=%d, local_xid=%d, local_coid=%d", pte[i].origin_node_id, pte[i].origin_xid, pte[i].local_xid, pte[i].local_coid);
 				*req_coid = pte[i].local_coid;
 				if (found_eff_coid)
 					break;

@@ -4240,7 +4240,6 @@ bgworker_apply_cset(IMessage *msg)
 	 * a TopTransactionContext where the change set data is stored.
 	 */
 	StartTransactionCommand();
-	elog(LOG, "csets_recvd_counter=%d", csets_recvd_counter);
 	if (csets_recvd_counter == 0) {
 		BeginTransactionBlock();
 		CommitTransactionCommand();
