@@ -250,7 +250,11 @@ cset_process(EState *estate)
 				stmt_id = istream_read_int32(reader);
 				csi = find_statement(stmt_id);
 				Assert(csi);
+				estate->es_output_cid = GetCurrentCommandId(true);
+				elog(LOG, "estate->es_output_cid = %d", estate->es_output_cid);
 				ExecProcessTuple(reader, estate, csi);
+				CommitTransactionCommand();
+				elog(LOG, "currentCommandId = %d", GetCurrentCommandId(true));
 				break;
 
 			case CSCMD_INSERT:
