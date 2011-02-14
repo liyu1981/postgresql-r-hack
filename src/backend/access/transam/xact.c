@@ -2424,6 +2424,7 @@ StartTransactionCommand(void)
 		case TBLOCK_SUBABORT:
 			break;
 
+#ifdef REPLICATION
 			/* These cases are invalid. */
 		case TBLOCK_STARTED:
 		case TBLOCK_BEGIN:
@@ -2440,12 +2441,14 @@ StartTransactionCommand(void)
 			elog(ERROR, "StartTransactionCommand: unexpected state %s",
 				 BlockStateAsString(s->blockState));
 			break;
+#endif
 	}
 
 	/*
 	 * We must switch to CurTransactionContext before returning. This is
 	 * already done if we called StartTransaction, otherwise not.
 	 */
+	elog(LOG, "CurrentTransactionBlockState = %s", BlockStateAsString(s->blockState));
 	Assert(CurTransactionContext != NULL);
 	MemoryContextSwitchTo(CurTransactionContext);
 }
