@@ -592,6 +592,10 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 		SpinLockRelease(&rctl->ptxn_lock);
 	}
 	END_CRIT_SECTION();
+
+	if (found_eff_coid && !found_req_coid) {
+		*req_coid = *eff_coid;
+	}
 }
 
 /*

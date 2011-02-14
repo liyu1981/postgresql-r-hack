@@ -124,6 +124,7 @@ deserialize_tuple_attr(IStreamReader reader, TupleDesc tdesc, Datum *attr, int a
 
 	size = istream_read_int32(reader);
 	str = (char*) palloc(size + 1);
+	memset(str, 0, size+1);
 	istream_read_data(reader, str, size);
 	str[size] = 0;
 	Assert(strlen(str) == size);

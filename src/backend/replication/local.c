@@ -447,31 +447,6 @@ replication_global_commit(void)
 
 	/* liyu: below await_imessage will try to wait an commit imsg from
 	   gcs, but in a very ditry way: forever loop...
-
-	   this currently is known to be very dirty solution: it will
-	   breaks the pg's single query commitment. For instance, in
-	   original pg
-
-	       INSERT INTO sometable VALUES(...)
-	       COMMIT
-	       COMMIT (as many as you can)
-
-	   will work. No block, no competetion, no worry about the spin
-	   lock failure. But with await_imessage, that will break. The
-	   reason could be that:
-
-	       1. insert (without a begin transaction) will commmit as
-	       soon as the insertion done.  
-
-	       2. the following commit command does not know that, issuing
-	       another global_commit
-
-	       3. the next commit command do the same thing 
-
-	       ...  finally
-	       everyone will die because some backend will be panic :(
-
-	       FIXME: THIS MUST BE CHANGED!!
 	 */
 	/*
 	 * wait for our changeset to be delivered via the totally
