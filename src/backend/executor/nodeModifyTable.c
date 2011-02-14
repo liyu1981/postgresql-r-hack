@@ -1243,6 +1243,8 @@ ExecProcessTuple(IStreamReader reader, EState *estate, CsetStmtInfo *csi)
 
 	Assert(IsXactIsoLevelSerializable);
 
+	elog(LOG, "[relation %d] apply cset type %d", csi->base_rel->rd_id, csi->type);
+
 	/* FIXME: indentation */
 	{
 		/*
@@ -1287,23 +1289,29 @@ retry_tuple:
 			 * tuples with these primary key values.
 			 */
 			if (!csi->iscan) {
-				/*
 				for(i = 0; i< idx_rel->rd_index->indnatts; ++i) {
-					elog(LOG, "[relation %d] skeys[%d]: %d\n", csi->base_rel->rd_id, i, skeys[i].sk_argument);
+					elog(LOG, "[relation %d] skeys[%d]: %d", csi->base_rel->rd_id, i, skeys[i].sk_argument);
 				}
-				*/
+				elog(LOG, "current snapshot: xmin %d, xmax %d", estate->es_snapshot->xmin, estate->es_snapshot->xmax);
+				for(i = 0; i<estate->es_snapshot->xcnt; ++i) {
+					elog(LOG, "=> (%d)", estate->es_snapshot->xip[i]);
+				}
 				csi->iscan = index_beginscan(csi->base_rel, idx_rel,
 											 estate->es_snapshot, numKeys,
 											 skeys);
+				elog(LOG, "csi->xs_recheck %d", csi->iscan->xs_recheck);
 			}
-			else
+			else {
+				elog(LOG, "index_rescan");
 				index_rescan(csi->iscan, skeys);	
+			}
 
 continue_scan:
 			/*
 			 * Get the next tuple that matches the primary key.
 			 */
 			oldtuple = index_getnext(csi->iscan, ForwardScanDirection);
+			elog(LOG, "oldtuple = %d, valid?=%d", (int)oldtuple, HeapTupleIsValid(oldtuple));
 			if (oldtuple && HeapTupleIsValid(oldtuple))
 			{
 				Assert(ItemPointerIsValid(&oldtuple->t_self));
@@ -1394,12 +1402,15 @@ continue_scan:
 									   &oldtuple->t_self));
 				Assert(ItemIdIsNormal(lp));
 
+				if(result != HeapTupleSelfUpdated) {
 				/*
 				 * Get the two CommitOrderIds involved in one atomic step, so
 				 * that the minimum known good coid can't advance in between.
 				 */
 				get_multi_coids(&eff_coid, &req_coid, xmin,
 								origin_node_id, origin_xid);
+
+				elog(LOG, "eff_coid=%d, req_coid=%d with xmin=%d", eff_coid, req_coid, xmin);
 
 #ifdef DEBUG_CSET_APPL
 				elog(DEBUG5, "bg worker [%d/%d]: ExecProcessTuple: required coid: %d, effective coid: %d",
@@ -1415,10 +1426,11 @@ continue_scan:
 
 				if (eff_coid != req_coid)
 				{
-					elog(DEBUG5, "bg worker [%d/%d]: ExecProcessTuple: must abort, since an earlier transaction has updated this tuple.",
+					elog(DEBUG1, "bg worker [%d/%d]: ExecProcessTuple: must abort, since an earlier transaction has updated this tuple.",
 						 MyProcPid, MyBackendId);
 					MyProc->abortFlag = true;
 					goto abort_cset_application;
+				}
 				}
 			}
 
@@ -1493,6 +1505,16 @@ continue_scan:
 
 				estate->es_lastoid = newId;
 				setLastTid(&(newtuple->t_self));
+				elog(LOG, "estate snapshot: xmin %d, xmax %d; newtuple: xmin %d, xmax %d",
+				     estate->es_snapshot->xmin, estate->es_snapshot->xmax,
+				     newtuple->t_data->t_choice.t_heap.t_xmin,
+				     newtuple->t_data->t_choice.t_heap.t_xmax);
+
+				get_multi_coids(&eff_coid, &req_coid, newtuple->t_data->t_choice.t_heap.t_xmin,
+								origin_node_id, origin_xid);
+
+				elog(LOG, "after insert eff_coid=%d, req_coid=%d with xmin=%d",
+				     eff_coid, req_coid, newtuple->t_data->t_choice.t_heap.t_xmin);
 				break;
 
 			case CSCMD_DELETE:
@@ -1529,6 +1551,11 @@ continue_scan:
 				Assert(result == HeapTupleMayBeUpdated);
 				heap_update_internal(csi->base_rel, oldtuple, newtuple,
 									 buffer, estate->es_output_cid);
+				elog(LOG, "estate snapshot: xmin %d, xmax %d; newtuple: xmin %d, xmax %d",
+				     estate->es_snapshot->xmin, estate->es_snapshot->xmax,
+				     newtuple->t_data->t_choice.t_heap.t_xmin,
+				     newtuple->t_data->t_choice.t_heap.t_xmax);
+
 				break;
 			
 			default:
@@ -1549,10 +1576,15 @@ continue_scan:
 		if ((csi->type == CSCMD_INSERT || csi->type == CSCMD_UPDATE))
 		{
 			if (csi->rr_info->ri_NumIndices > 0 &&
-				!HeapTupleIsHeapOnly(newtuple))
+			    !HeapTupleIsHeapOnly(newtuple))
+			{
 				recheckIndexes = ExecInsertIndexTuples(&slot,
 													   &(newtuple->t_self),
 													   estate);
+				elog(LOG, "Index inserted for %d", &(newtuple->t_self));
+			}
+
+			elog(LOG, "Index: %d, key=%d", list_length(recheckIndexes), slot.tts_values[0]);
 
 			list_free(recheckIndexes);
 		}
@@ -1567,6 +1599,12 @@ abort_cset_application:
 	elog(DEBUG3, "bg worker [%d/%d]: ExecProcessTuple: processed tuple sucessfully",
 		 MyProcPid, MyBackendId);
 #endif
+
+	if (csi->iscan) {
+		elog(LOG, "End scan.");
+		//index_endscan(csi->iscan);
+		//csi->iscan = NULL;
+	}
 }
 
 #endif
