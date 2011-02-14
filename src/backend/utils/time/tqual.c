@@ -337,22 +337,27 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 {
 	if (!(tuple->t_infomask & HEAP_XMIN_COMMITTED))
 	{
-		if (tuple->t_infomask & HEAP_XMIN_INVALID)
+		if (tuple->t_infomask & HEAP_XMIN_INVALID) {
+			elog(LOG, "HeapTupleSatisfiesNow failed 1.");
 			return false;
+		}
 
 		/* Used by pre-9.0 binary upgrades */
 		if (tuple->t_infomask & HEAP_MOVED_OFF)
 		{
 			TransactionId xvac = HeapTupleHeaderGetXvac(tuple);
 
-			if (TransactionIdIsCurrentTransactionId(xvac))
+			if (TransactionIdIsCurrentTransactionId(xvac)) {
+				elog(LOG, "HeapTupleSatisfiesNow failed 2.");
 				return false;
+			}
 			if (!TransactionIdIsInProgress(xvac))
 			{
 				if (TransactionIdDidCommit(xvac))
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
+					elog(LOG, "HeapTupleSatisfiesNow failed 3.");
 					return false;
 				}
 				SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
@@ -366,8 +371,10 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 
 			if (!TransactionIdIsCurrentTransactionId(xvac))
 			{
-				if (TransactionIdIsInProgress(xvac))
+				if (TransactionIdIsInProgress(xvac)) {
+					elog(LOG, "HeapTupleSatisfiesNow failed 4.");
 					return false;
+				}
 				if (TransactionIdDidCommit(xvac))
 					SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 								InvalidTransactionId);
@@ -375,14 +382,17 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
+					elog(LOG, "HeapTupleSatisfiesNow failed 5.");
 					return false;
 				}
 			}
 		}
 		else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple)))
 		{
-			if (HeapTupleHeaderGetCmin(tuple) >= GetCurrentCommandId(false))
+			if (HeapTupleHeaderGetCmin(tuple) >= GetCurrentCommandId(false)) {
+				elog(LOG, "HeapTupleSatisfiesNow failed 6.");
 				return false;	/* inserted after scan started */
+			}
 
 			if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid */
 				return true;
@@ -402,11 +412,15 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 
 			if (HeapTupleHeaderGetCmax(tuple) >= GetCurrentCommandId(false))
 				return true;	/* deleted after scan started */
-			else
+			else {
+				elog(LOG, "HeapTupleSatisfiesNow failed 7.");
 				return false;	/* deleted before scan started */
+			}
 		}
-		else if (TransactionIdIsInProgress(HeapTupleHeaderGetXmin(tuple)))
+		else if (TransactionIdIsInProgress(HeapTupleHeaderGetXmin(tuple))) {
+			elog(LOG, "HeapTupleSatisfiesNow failed 8.");
 			return false;
+		}
 		else if (TransactionIdDidCommit(HeapTupleHeaderGetXmin(tuple)))
 			SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 						HeapTupleHeaderGetXmin(tuple));
@@ -415,6 +429,7 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 			/* it must have aborted or crashed */
 			SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 						InvalidTransactionId);
+			elog(LOG, "HeapTupleSatisfiesNow failed 9.");
 			return false;
 		}
 	}
@@ -428,6 +443,7 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 	{
 		if (tuple->t_infomask & HEAP_IS_LOCKED)
 			return true;
+		elog(LOG, "HeapTupleSatisfiesNow failed 10.");
 		return false;
 	}
 
@@ -444,8 +460,10 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 			return true;
 		if (HeapTupleHeaderGetCmax(tuple) >= GetCurrentCommandId(false))
 			return true;		/* deleted after scan started */
-		else
+		else {
+			elog(LOG, "HeapTupleSatisfiesNow failed 11.");
 			return false;		/* deleted before scan started */
+		}
 	}
 
 	if (TransactionIdIsInProgress(HeapTupleHeaderGetXmax(tuple)))
@@ -470,6 +488,7 @@ HeapTupleSatisfiesNow(HeapTupleHeader tuple, Snapshot snapshot, Buffer buffer)
 
 	SetHintBits(tuple, buffer, HEAP_XMAX_COMMITTED,
 				HeapTupleHeaderGetXmax(tuple));
+	elog(LOG, "HeapTupleSatisfiesNow failed 12.");
 	return false;
 }
 
@@ -914,22 +933,27 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 {
 	if (!(tuple->t_infomask & HEAP_XMIN_COMMITTED))
 	{
-		if (tuple->t_infomask & HEAP_XMIN_INVALID)
+		if (tuple->t_infomask & HEAP_XMIN_INVALID) {
+			elog(LOG, "HeapTupleSatisfiesMVCC failed 1.");
 			return false;
+		}
 
 		/* Used by pre-9.0 binary upgrades */
 		if (tuple->t_infomask & HEAP_MOVED_OFF)
 		{
 			TransactionId xvac = HeapTupleHeaderGetXvac(tuple);
 
-			if (TransactionIdIsCurrentTransactionId(xvac))
+			if (TransactionIdIsCurrentTransactionId(xvac)) {
+				elog(LOG, "HeapTupleSatisfiesMVCC failed 2.");
 				return false;
+			}
 			if (!TransactionIdIsInProgress(xvac))
 			{
 				if (TransactionIdDidCommit(xvac))
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
+					elog(LOG, "HeapTupleSatisfiesMVCC failed 3.");
 					return false;
 				}
 				SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
@@ -943,8 +967,10 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 
 			if (!TransactionIdIsCurrentTransactionId(xvac))
 			{
-				if (TransactionIdIsInProgress(xvac))
+				if (TransactionIdIsInProgress(xvac)) {
+					elog(LOG, "HeapTupleSatisfiesMVCC failed 4.");
 					return false;
+				}
 				if (TransactionIdDidCommit(xvac))
 					SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 								InvalidTransactionId);
@@ -952,14 +978,17 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
+					elog(LOG, "HeapTupleSatisfiesMVCC failed 5.");
 					return false;
 				}
 			}
 		}
 		else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple)))
 		{
-			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
+			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid) {
+				elog(LOG, "HeapTupleSatisfiesMVCC failed 6.");
 				return false;	/* inserted after scan started */
+			}
 
 			if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid */
 				return true;
@@ -979,11 +1008,15 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 
 			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
 				return true;	/* deleted after scan started */
-			else
+			else {
+				elog(LOG, "HeapTupleSatisfiesMVCC failed 7.");
 				return false;	/* deleted before scan started */
+			}
 		}
-		else if (TransactionIdIsInProgress(HeapTupleHeaderGetXmin(tuple)))
+		else if (TransactionIdIsInProgress(HeapTupleHeaderGetXmin(tuple))) {
+			elog(LOG, "HeapTupleSatisfiesMVCC failed 8.");
 			return false;
+		}
 		else if (TransactionIdDidCommit(HeapTupleHeaderGetXmin(tuple)))
 			SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 						HeapTupleHeaderGetXmin(tuple));
@@ -992,6 +1025,7 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 			/* it must have aborted or crashed */
 			SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 						InvalidTransactionId);
+			elog(LOG, "HeapTupleSatisfiesMVCC failed 9.");
 			return false;
 		}
 	}
@@ -1000,8 +1034,10 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 	 * By here, the inserting transaction has committed - have to check
 	 * when...
 	 */
-	if (XidInMVCCSnapshot(HeapTupleHeaderGetXmin(tuple), snapshot))
+	if (XidInMVCCSnapshot(HeapTupleHeaderGetXmin(tuple), snapshot)) {
+		elog(LOG, "HeapTupleSatisfiesMVCC failed 10.");
 		return false;			/* treat as still in progress */
+	}
 
 	if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid or aborted */
 		return true;
@@ -1022,8 +1058,10 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 		{
 			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
 				return true;	/* deleted after scan started */
-			else
+			else {
+				elog(LOG, "HeapTupleSatisfiesMVCC failed 11.");
 				return false;	/* deleted before scan started */
+			}
 		}
 
 		if (TransactionIdIsInProgress(HeapTupleHeaderGetXmax(tuple)))
@@ -1048,6 +1086,7 @@ HeapTupleSatisfiesMVCC(HeapTupleHeader tuple, Snapshot snapshot,
 	if (XidInMVCCSnapshot(HeapTupleHeaderGetXmax(tuple), snapshot))
 		return true;			/* treat as still in progress */
 
+	elog(LOG, "HeapTupleSatisfiesMVCC failed 12.");
 	return false;
 }
 
