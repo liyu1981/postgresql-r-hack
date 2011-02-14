@@ -596,6 +596,13 @@ index_getnext(IndexScanDesc scan, ScanDirection direction)
 
 				return heapTuple;
 			}
+			else {
+				elog(LOG, "Find a not visible tuple: xmin %d, xmax %d, cid %d, heap_xmin_committed?=%d.",
+				     heapTuple->t_data->t_choice.t_heap.t_xmin,
+				     heapTuple->t_data->t_choice.t_heap.t_xmax,
+				     heapTuple->t_data->t_choice.t_heap.t_field3.t_cid,
+				     (heapTuple->t_data->t_infomask & HEAP_XMIN_COMMITTED));
+			}
 
 			/*
 			 * If we can't see it, maybe no one else can either.  Check to see
