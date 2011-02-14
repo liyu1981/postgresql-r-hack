@@ -4240,6 +4240,11 @@ bgworker_apply_cset(IMessage *msg)
 	 * a TopTransactionContext where the change set data is stored.
 	 */
 	StartTransactionCommand();
+	elog(LOG, "csets_recvd_counter=%d", csets_recvd_counter);
+	if (csets_recvd_counter == 0) {
+		BeginTransactionBlock();
+		CommitTransactionCommand();
+	}
 
 	/*
 	 * Prepare the change set reader, which then waits for following
@@ -4253,6 +4258,7 @@ bgworker_apply_cset(IMessage *msg)
 	 * data and start change set application using the above reader.
 	 */
 	estate = CreateExecutorState();
+
 	cset_process(estate);
 
 	return false;
@@ -4301,6 +4307,7 @@ bgworker_commit_request(IMessage *msg)
 				 MyProcPid, MyBackendId, origin_node_id, origin_xid);
 //#endif
 
+			EndTransactionBlock();
 			CommitTransactionCommand();
 
 			bgworker_job_completed();
