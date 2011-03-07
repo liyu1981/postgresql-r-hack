@@ -35,7 +35,6 @@ static int ReplLutCtlShmemSize(void);
 void InitSharedPeerTxnQueue(int size);
 void InitSharedGOLHash(int size);
 void InitSharedLOLHash(int size);
-PeerTxnEntry* alloc_new_entry();
 
 char *
 decode_database_state(rdb_state state)
@@ -105,6 +104,7 @@ HTAB *SharedPeerTxnHash;
 HTAB *SharedGOLHash;
 HTAB *SharedLOLHash;
 
+PeerTxnEntry* alloc_new_entry();
 
 static int
 ReplLutCtlShmemSize(void)
@@ -302,7 +302,7 @@ alloc_new_entry()
 
 	if (rctl->ptxn_head >= PeerTxnEntries) {
 		/* run out of space, must clear and consoliate first */
-		tmp_ptes = (PeerTxnEntries*)malloc(sizeof(PeerTxnEntry)*PeerTxnEntries);
+		tmp_ptes = (PeerTxnEntry*)malloc(sizeof(PeerTxnEntry) * PeerTxnEntries);
 		for (i = 0; i< PeerTxnEntries; ++i) {
 			tmp_ptes[i].origin_node_id = InvalidNodeId;
 			tmp_ptes[i].valid = false;
@@ -317,14 +317,16 @@ alloc_new_entry()
 			}
 		}
 
-		memcpy(rctl[1], tmp_ptes, sizeof(PeerTxnEntry)*count);
+		memcpy(&rctl[1], tmp_ptes, sizeof(PeerTxnEntry)*count);
 		rctl->ptxn_tail = 0;
 		rctl->ptxn_head = count;
+
+		free(tmp_ptes);
 	}
 
 	pte = (PeerTxnEntry*) &rctl[1];
 	pte = &pte[rctl->ptxn_head++];
-	pte->valide = true;
+	pte->valid = true;
 	return pte;
 }
 
@@ -405,11 +407,9 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid)
 {
 	PeerTxnEntry   *pte;
 
-	Assert(CommitOrderIdIsValid(local_coid));
-
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG5, "Coordinator: erasing origin node %d xid %d -> local coid: %d",
-		 origin_node_id, origin_xid, local_coid);
+	elog(DEBUG5, "Coordinator: erasing origin node %d xid %d",
+		 origin_node_id, origin_xid);
 #endif
 
 	START_CRIT_SECTION();
