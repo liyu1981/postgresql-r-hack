@@ -4310,6 +4310,7 @@ bgworker_commit_request(IMessage *msg)
 			CommitTransactionCommand();
 
 			bgworker_job_completed();
+			erase_transaction(origin_node_id, origin_xid);
 
 			Assert(!TransactionIdIsValid(GetTopTransactionIdIfAny()));
 		}
@@ -4343,12 +4344,14 @@ bool
 bgworker_abort_request(IMessage *msg)
 {
 	buffer			b;
+	NodeId          origin_node_id;
+	TransactionId   origin_xid;
 
 	IMessageGetReadBuffer(&b, msg);
 
 	/* skip the sender node id and origin xid */
-	get_int32(&b);
-	get_int32(&b);
+	origin_node_id = get_int32(&b);
+	origin_xid = get_int32(&b);
 
 	IMessageRemove(msg);
 
@@ -4360,6 +4363,8 @@ bgworker_abort_request(IMessage *msg)
 	set_ps_display("remote transaction", false);
 
 	AbortOutOfAnyTransaction();
+
+	erase_transaction(origin_node_id, origin_xid);
 
 	return true;
 }

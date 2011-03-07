@@ -35,6 +35,7 @@ static int ReplLutCtlShmemSize(void);
 void InitSharedPeerTxnQueue(int size);
 void InitSharedGOLHash(int size);
 void InitSharedLOLHash(int size);
+PeerTxnEntry* alloc_new_entry();
 
 char *
 decode_database_state(rdb_state state)
@@ -85,6 +86,7 @@ typedef struct PeerTxnEntry
 	TransactionId	origin_xid;
 	TransactionId	local_xid;
 	CommitOrderId	local_coid;
+	bool            valid;
 } PeerTxnEntry;
 
 typedef struct GlobalOidLookupEntry
@@ -157,8 +159,10 @@ InitSharedPeerTxnQueue(int size)
 
 		pte = (PeerTxnEntry*) &rctl[1];
 
-		for (i = 0; i < PeerTxnEntries; i++)
+		for (i = 0; i < PeerTxnEntries; i++) {
 			pte[i].origin_node_id = InvalidNodeId;
+			pte[i].valid = false;
+		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
 	}
@@ -265,6 +269,11 @@ find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 	PeerTxnEntry			   *pte = (PeerTxnEntry*) &rctl[1];
 	int							i;
 
+	/*
+	  liyu: this is a linear search. Consider that origin_node_id and
+	  origin_xid related search is frequent, there is definitely
+	  potential of performance improvement.
+	 */
 	/* we don't support wrapping, yet */
 	Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 	for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
@@ -282,6 +291,41 @@ find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 	}
 
 	return NULL;
+}
+
+PeerTxnEntry *
+alloc_new_entry()
+{
+	PeerTxnEntry            *pte, *tmp_pte, *tmp_ptes;
+	volatile ReplLutCtlData *rctl = ReplLutCtl;
+	int                      i, count;
+
+	if (rctl->ptxn_head >= PeerTxnEntries) {
+		/* run out of space, must clear and consoliate first */
+		tmp_ptes = (PeerTxnEntries*)malloc(sizeof(PeerTxnEntry)*PeerTxnEntries);
+		for (i = 0; i< PeerTxnEntries; ++i) {
+			tmp_ptes[i].origin_node_id = InvalidNodeId;
+			tmp_ptes[i].valid = false;
+		}
+
+		count = 0;
+		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; ++i) {
+			tmp_pte = (PeerTxnEntry*)&rctl[i];
+			if (tmp_pte->valid) {
+				memcpy(&tmp_ptes[count], tmp_pte, sizeof(PeerTxnEntry));
+				++count;
+			}
+		}
+
+		memcpy(rctl[1], tmp_ptes, sizeof(PeerTxnEntry)*count);
+		rctl->ptxn_tail = 0;
+		rctl->ptxn_head = count;
+	}
+
+	pte = (PeerTxnEntry*) &rctl[1];
+	pte = &pte[rctl->ptxn_head++];
+	pte->valide = true;
+	return pte;
 }
 
 void
@@ -307,8 +351,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		pte = find_entry_for(origin_node_id, origin_xid);
 		if (!pte)
 		{
-			pte = (PeerTxnEntry*) &rctl[1];
-			pte = &pte[rctl->ptxn_head++];
+			pte = alloc_new_entry();
 			pte->origin_node_id = origin_node_id;
 			pte->origin_xid = origin_xid;
 			pte->local_xid = InvalidTransactionId;
@@ -344,14 +387,48 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 		pte = find_entry_for(origin_node_id, origin_xid);
 		if (!pte)
 		{
-			pte = (PeerTxnEntry*) &rctl[1];
-			pte = &pte[rctl->ptxn_head++];
+			pte = alloc_new_entry();
 			pte->origin_node_id = origin_node_id;
 			pte->origin_xid = origin_xid;
 			pte->local_coid = InvalidCommitOrderId;
 		}
 
 		pte->local_xid = local_xid;
+
+		SpinLockRelease(&rctl->ptxn_lock);
+	}
+	END_CRIT_SECTION();
+}
+
+void
+erase_transaction(NodeId origin_node_id, TransactionId origin_xid)
+{
+	PeerTxnEntry   *pte;
+
+	Assert(CommitOrderIdIsValid(local_coid));
+
+#ifdef COORDINATOR_DEBUG
+	elog(DEBUG5, "Coordinator: erasing origin node %d xid %d -> local coid: %d",
+		 origin_node_id, origin_xid, local_coid);
+#endif
+
+	START_CRIT_SECTION();
+	{
+		/* use volatile pointer to prevent code rearrangement */
+		volatile ReplLutCtlData *rctl = ReplLutCtl;
+
+		SpinLockAcquire(&rctl->ptxn_lock);
+
+		while(1) {
+			pte = find_entry_for(origin_node_id, origin_xid);
+			if (pte)
+			{
+				pte->origin_node_id = InvalidNodeId;
+				pte->valid = false;
+			}
+			else
+				break;
+		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
 	}

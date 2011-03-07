@@ -82,6 +82,9 @@ extern void store_transaction_local_xid(NodeId origin_node_id,
 										TransactionId origin_xid,
 										TransactionId local_xid);
 
+extern void erase_transaction(NodeId origin_node_id,
+                              TransactionId origin_xid);
+
 /* query functions */
 extern void get_multi_coids(CommitOrderId *eff_coid,
 							CommitOrderId *req_coid,
