@@ -21,6 +21,9 @@
 #include "miscadmin.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/hash.h"
+#include "catalog/pg_replication.h"
+#include "catalog/indexing.h"
 #include "storage/imsg.h"
 #include "storage/lwlock.h"
 #include "storage/lmgr.h"
@@ -31,10 +34,55 @@
 #include "replication/cset.h"
 #include "replication/utils.h"
 
-static int ReplLutCtlShmemSize(void);
-void InitSharedPeerTxnQueue(int size);
-void InitSharedGOLHash(int size);
-void InitSharedLOLHash(int size);
+#define PeerTxnEntries 1000
+
+typedef struct PeerTxnEntry
+{
+	NodeId			origin_node_id;
+	TransactionId	origin_xid;
+	TransactionId	local_xid;
+	CommitOrderId	local_coid;
+	bool            valid;
+	bool            aborted;
+	bool            tic;
+} PeerTxnEntry;
+
+typedef struct PteOriginHashEntry
+{
+	int8 origin_node_id_xid; /* first 4bytes=node_id, second 4bytes=xid */
+	PeerTxnEntry  *pte;
+} PteOriginHashEntry;
+
+#define FORM_ORIGIN_NODE_ID_XID(nid, xid) ((int8)((nid))<<sizeof(int4)) | (int8)((xid))
+
+typedef struct PteLocalXidHashEntry
+{
+	TransactionId  local_xid;
+	PeerTxnEntry  *pte;
+} PteLocalXidHashEntry;
+
+typedef struct PteLocalCoidHashEntry
+{
+	TransactionId  local_coid;
+	PeerTxnEntry  *pte;
+} PteLocalCoidHashEntry;
+
+/* globals keeping pointers to the shmem areas */
+ReplLutCtlData *ReplLutCtl;
+HTAB           *PteOriginHash;
+HTAB           *PteLocalXidHash;
+HTAB           *PteLocalCoidHash;
+RegProcedure    pg_replication_eq_func;
+
+void          InitPte(PeerTxnEntry *pte);
+int           ReplLutCtlShmemSize();
+void          InitSharedPeerTxnQueue();
+void          InitPteHash();
+PeerTxnEntry* alloc_new_entry();
+void          storePteToPgReplication(PeerTxnEntry *pte);
+void          insertPteHash(PeerTxnEntry *pte);
+void          deletePteHash(PeerTxnEntry *pte);
+CommitOrderId getLowestKnownCommitOrderId();
 
 char *
 decode_database_state(rdb_state state)
@@ -74,40 +122,17 @@ decode_command_type(CsetCmdType cmd)
 	}
 }
 
-
-#define PeerTxnEntries 1000
-#define GOLEntries 1000
-#define LOLEntries 1000
-
-typedef struct PeerTxnEntry
+void
+initPte(PeerTxnEntry *pte)
 {
-	NodeId			origin_node_id;
-	TransactionId	origin_xid;
-	TransactionId	local_xid;
-	CommitOrderId	local_coid;
-	bool            valid;
-} PeerTxnEntry;
+	pte->origin_node_id = InvalidNodeId;
+	pte->valid = false;
+	pte->tic = false;
+	pte->aborted = false;
+}
 
-typedef struct GlobalOidLookupEntry
-{
-	Oid		loid, goid;
-} GlobalOidLookupEntry;
-
-typedef struct LocalOidLookupEntry
-{
-	Oid		goid, loid;
-} LocalOidLookupEntry;
-
-/* globals keeping pointers to the shmem areas */
-ReplLutCtlData *ReplLutCtl;
-HTAB *SharedPeerTxnHash;
-HTAB *SharedGOLHash;
-HTAB *SharedLOLHash;
-
-PeerTxnEntry* alloc_new_entry();
-
-static int
-ReplLutCtlShmemSize(void)
+int
+ReplLutCtlShmemSize()
 {
 	Size		size;
 
@@ -116,33 +141,25 @@ ReplLutCtlShmemSize(void)
 
 	/* size of peer transaction queue */
 	size = add_size(size, mul_size(PeerTxnEntries,
-		MAXALIGN(sizeof(PeerTxnEntry))));
+	                               MAXALIGN(sizeof(PeerTxnEntry))));
+
+	/* size of PteOriginHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteOriginHashEntry))));
+
+	/* size of PteLocalXidHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteLocalXidHashEntry))));
+
+	/* size of PteLocalCoidHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteLocalCoidHashEntry))));
 
 	return size;
 }
-
-
-int
-ReplLutShmemSize(void)
-{
-	Size		size = ReplLutCtlShmemSize();
-
-	/* size of local oid -> global oid LUT */
-	size = add_size(size, mul_size(GOLEntries, 
-		MAXALIGN(sizeof(HASHELEMENT)) +
-			MAXALIGN(sizeof(GlobalOidLookupEntry))));
-
-	/* size of control structure */
-	size = add_size(size, mul_size(LOLEntries,
-		MAXALIGN(sizeof(HASHELEMENT)) +
-			MAXALIGN(sizeof(LocalOidLookupEntry))));
-
-	return size;
-}
-
 
 void
-InitSharedPeerTxnQueue(int size)
+InitSharedPeerTxnQueue()
 {
 	int				i;
 	PeerTxnEntry   *pte;
@@ -156,12 +173,12 @@ InitSharedPeerTxnQueue(int size)
 
 		rctl->ptxn_head = 0;
 		rctl->ptxn_tail = 0;
+		rctl->ptxn_laststop = 0;
 
 		pte = (PeerTxnEntry*) &rctl[1];
 
 		for (i = 0; i < PeerTxnEntries; i++) {
-			pte[i].origin_node_id = InvalidNodeId;
-			pte[i].valid = false;
+			initPte(&pte[i]);
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -169,9 +186,8 @@ InitSharedPeerTxnQueue(int size)
 	END_CRIT_SECTION();
 }
 
-
 void
-InitSharedGOLHash(int size)
+InitPteHash()
 {
 	HASHCTL		info;
 
@@ -180,69 +196,56 @@ InitSharedGOLHash(int size)
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
-		SpinLockAcquire(&rctl->gol_lock);
+		SpinLockAcquire(&rctl->origin_lock);
+		info.keysize = sizeof(int8);
+		info.entrysize = sizeof(PteOriginHashEntry);
+		info.hash = hashint8;
+		PteOriginHash = ShmemInitHash("PteOriginHash",
+		                              PeerTxnEntries, PeerTxnEntries, &info,
+		                              HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
+		if (!PteOriginHash)
+			elog(FATAL, "Could not initialize PteOriginHash hash table");
+		SpinLockRelease(&rctl->origin_lock);
 
-		/* BufferTag maps to Buffer */
-		info.keysize = sizeof(Oid);
-		info.entrysize = sizeof(GlobalOidLookupEntry);
-		info.hash = oid_hash;
+		SpinLockAcquire(&rctl->localxid_lock);
+		info.keysize = sizeof(TransactionId);
+		info.entrysize = sizeof(PteLocalXidHashEntry);
+		info.hash = hashint4;
+		PteLocalXidHash = ShmemInitHash("PteLocalxidHash",
+		                                PeerTxnEntries, PeerTxnEntries, &info,
+		                                HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
+		if (!PteLocalXidHash)
+			elog(FATAL, "Could not initialize PteLocalXidHash hash table");
+		SpinLockRelease(&rctl->localxid_lock);
 
-		SharedGOLHash = ShmemInitHash("Shared Global Oid Lookup Table",
-			size, size, &info,
-			HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
-
-		if (!SharedGOLHash)
-			elog(FATAL, "could not initialize shared buffer hash table");
-
-		SpinLockRelease(&rctl->ptxn_lock);
+		SpinLockAcquire(&rctl->localcoid_lock);
+		info.keysize = sizeof(TransactionId);
+		info.entrysize = sizeof(PteLocalXidHashEntry);
+		info.hash = hashint4;
+		PteLocalCoidHash = ShmemInitHash("PteLocalcoidHash",
+		                                 PeerTxnEntries, PeerTxnEntries, &info,
+		                                 HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
+		if (!PteLocalCoidHash)
+			elog(FATAL, "Could not initialize PteLocalCoidHash hash table");
+		SpinLockRelease(&rctl->localxid_lock);
 	}
 	END_CRIT_SECTION();
 }
-
-
-void
-InitSharedLOLHash(int size)
-{
-	HASHCTL		info;
-
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-
-		SpinLockAcquire(&rctl->lol_lock);
-
-		/* BufferTag maps to Buffer */
-		info.keysize = sizeof(Oid);
-		info.entrysize = sizeof(LocalOidLookupEntry);
-		info.hash = oid_hash;
-
-		SharedLOLHash = ShmemInitHash("Shared Local Oid Lookup Table",
-			size, size, &info,
-			HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
-
-		if (!SharedGOLHash)
-			elog(FATAL, "could not initialize shared buffer hash table");
-
-		SpinLockRelease(&rctl->ptxn_lock);
-	}
-	END_CRIT_SECTION();
-}
-
 
 void
 ReplLutShmemInit(void)
 {
-	bool		found;
+	bool	 found;
+	Relation idx_rel;
+	Oid      eq_func_oid;
 
 #ifdef IMSG_DEBUG
 	elog(DEBUG3, "ReplLutShmemInit(): initializing shared memory");
 	elog(DEBUG5, "                    of size %d", ReplLutCtlShmemSize());
 #endif
 
-	ReplLutCtl = (ReplLutCtlData *)
-		ShmemInitStruct("Replication Lookup Ctl",
-						ReplLutCtlShmemSize(), &found);
+	ReplLutCtl = (ReplLutCtlData *)ShmemInitStruct("Replication Lookup Ctl",
+	                                               ReplLutCtlShmemSize(), &found);
 
 	if (found)
 		return;
@@ -251,83 +254,242 @@ ReplLutShmemInit(void)
 
 	/* initialize all the spin locks */
 	SpinLockInit(&ReplLutCtl->ptxn_lock);
-	SpinLockInit(&ReplLutCtl->gol_lock);
-	SpinLockInit(&ReplLutCtl->lol_lock);
+	SpinLockInit(&ReplLutCtl->origin_lock);
+	SpinLockInit(&ReplLutCtl->localxid_lock);
+	SpinLockInit(&ReplLutCtl->localcoid_lock);
 
 	/* initialize all the hash tables */
-	InitSharedPeerTxnQueue(PeerTxnEntries);
-#if 0
-	InitSharedGOLHash(GOLEntries);
-	InitSharedLOLHash(LOLEntries);
-#endif
+	InitSharedPeerTxnQueue();
+	InitPteHash();
+
+	/* init pg_replication_eq_func.  liyu: this is possible because
+	   all 4 attrs in pg_replication are of type int32
+	 */
+	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+	get_sort_group_operators(idx_rel->rd_att->attrs[0]->atttypid,
+	                         false, true, false,
+	                         NULL, &eq_func_oid, NULL);
+	pg_replication_eq_func = get_opcode(eq_func_oid);
+	index_close(idx_rel, NoLock);
 }
 
 static PeerTxnEntry *
 find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 {
-	volatile ReplLutCtlData    *rctl = ReplLutCtl;
-	PeerTxnEntry			   *pte = (PeerTxnEntry*) &rctl[1];
-	int							i;
+	volatile ReplLutCtlData *rctl    = ReplLutCtl;
+	PeerTxnEntry			*pte     = (PeerTxnEntry*) &rctl[1];
+	int						 i;
+	Relation                 rep_rel = NULL;
+	Relation                 idx_rel = NULL;
+	Oid                      eq_func;
+	IndexScanDesc            scan;
+	ScanKey                  skeys;
+	HeapTuple                tuple;
+	int8                     search_key;
+	bool                     found;
+	void                    *ret;
+	bool                     isnull;
 
 	/*
-	  liyu: this is a linear search. Consider that origin_node_id and
-	  origin_xid related search is frequent, there is definitely
-	  potential of performance improvement.
+	  liyu: now this is a hash search.
 	 */
-	/* we don't support wrapping, yet */
-	Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-	for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-	{
-		if (pte[i].origin_node_id == origin_node_id &&
-			pte[i].origin_xid == origin_xid)
-		{
-#ifdef CSET_APPL_DEBUG
-			elog(DEBUG3, "bg worker [%d/%d]: found entry for (%d/%d)",
-				 MyProcPid, MyBackendId, origin_node_id, origin_xid);
-#endif
 
-			return &pte[i];
+	search_key = FORM_ORIGIN_NODE_ID_XID(origin_node_id, origin_xid);
+	found = false;
+	ret = hash_search(PteOriginHash, &search_key, HASH_FIND, &found);
+	if (ret != NULL) {
+		pte = ((PteOriginHashEntry*)ret)->pte;
+		return pte;
+	}
+
+	/*
+	  liyu: Now we have a system table pg_replication store the last
+	  committed origin-local combination. So if we do not find
+	  anything in the shmem list, we have to search the system table.
+	 */
+
+	pte = NULL;
+	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, get_opcode(eq_func), origin_node_id);
+	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, get_opcode(eq_func), origin_xid);
+	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+	tuple = index_getnext(scan, ForwardScanDirection);
+	if (tuple) {
+		pte = alloc_new_entry();
+		pte->origin_node_id = origin_node_id;
+		pte->origin_xid = origin_xid;
+		pte->valid = true;
+		pte->local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
+		                             rep_rel->rd_att, &isnull);
+		pte->local_coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+		                              rep_rel->rd_att, &isnull);
+	}
+	index_endscan(scan);
+	pfree(skeys);
+	index_close(idx_rel, NoLock);
+	heap_close(rep_rel, NoLock);
+
+	return pte;
+}
+
+PeerTxnEntry *
+alloc_new_entry()
+{
+	PeerTxnEntry            *pte;
+	volatile ReplLutCtlData *rctl = ReplLutCtl;
+	int                      i, old_laststop;
+	bool                     pass;
+
+	if (rctl->ptxn_head < PeerTxnEntries) {
+		/* still have not used slot (only happens shortly after init) */
+		pte = (PeerTxnEntry*) &rctl[1];
+		pte = &pte[rctl->ptxn_head++];
+		return pte;
+	}
+	else {
+		/* usual case, here we apply a clock algorithm to swap in-valid slot */
+		old_laststop = rctl->ptxn_laststop;
+		pass = false;
+		while(true) {
+			pte = (PeerTxnEntry*)&rctl[rctl->ptxn_laststop];
+			if (!pte->valid) {
+				if (!pte->tic) {
+					pte->tic = true;
+					rctl->ptxn_laststop += 1;
+					if (rctl->ptxn_laststop >= rctl->ptxn_head)
+						rctl->ptxn_laststop = 0;
+				}
+				else {
+					if (!pte->aborted)
+						storePteToPgReplication(pte);
+					initPte(pte);
+					rctl->ptxn_laststop += 1;
+					if (rctl->ptxn_laststop >= rctl->ptxn_head)
+						rctl->ptxn_laststop = 0;
+					return pte;
+				}
+			}
+			if (rctl->ptxn_laststop == old_laststop) {
+				if (!pass)
+					pass = true;
+				else {
+					/* we have done two round search, no in-valid slot now, must return */
+					break;
+				}
+			}
 		}
 	}
 
 	return NULL;
 }
 
-PeerTxnEntry *
-alloc_new_entry()
+void
+storePteToPgReplication(PeerTxnEntry *pte)
 {
-	PeerTxnEntry            *pte, *tmp_pte, *tmp_ptes;
-	volatile ReplLutCtlData *rctl = ReplLutCtl;
-	int                      i, count;
+	int			  i;
+	Relation      rep_rel = NULL;
+	Relation      idx_rel = NULL;
+	IndexScanDesc scan;
+	ScanKey       skeys;
+	HeapTuple     tuple;
+	HeapTuple     newtuple;
+	int           opflag;       /* 0 - insert, 1 - update */
+	Datum         values[Natts_pg_replication];
+	bool          nulls[Natts_pg_replication];
+	bool          doReplace[Natts_pg_replication];
 
-	if (rctl->ptxn_head >= PeerTxnEntries) {
-		/* run out of space, must clear and consoliate first */
-		tmp_ptes = (PeerTxnEntry*)malloc(sizeof(PeerTxnEntry) * PeerTxnEntries);
-		for (i = 0; i< PeerTxnEntries; ++i) {
-			tmp_ptes[i].origin_node_id = InvalidNodeId;
-			tmp_ptes[i].valid = false;
-		}
-
-		count = 0;
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; ++i) {
-			tmp_pte = (PeerTxnEntry*)&rctl[i];
-			if (tmp_pte->valid) {
-				memcpy(&tmp_ptes[count], tmp_pte, sizeof(PeerTxnEntry));
-				++count;
-			}
-		}
-
-		memcpy(&rctl[1], tmp_ptes, sizeof(PeerTxnEntry)*count);
-		rctl->ptxn_tail = 0;
-		rctl->ptxn_head = count;
-
-		free(tmp_ptes);
+	/* search for the old tuple first */
+	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, pg_replication_eq_func, pte->origin_node_id);
+	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, pg_replication_eq_func, pte->origin_xid);
+	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+	tuple = index_getnext(scan, ForwardScanDirection);
+	if (tuple) {
+		/* already have a record, but the old one is useless now */
+		newtuple = heap_copytuple(tuple);
+		opflag = 1;
 	}
+	else {
+		/* record not exist, so we insert new one */
+		opflag = 0;
+	}
+	index_endscan(scan);
+	pfree(skeys);
+	index_close(idx_rel, NoLock);
+	heap_close(rep_rel, NoLock);
 
-	pte = (PeerTxnEntry*) &rctl[1];
-	pte = &pte[rctl->ptxn_head++];
-	pte->valid = true;
-	return pte;
+	/* now either insert or update */
+	rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(doReplace, true, sizeof(doReplace));
+	values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
+	values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
+	values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
+	values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
+	if (opflag == 0) {
+		newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
+		simple_heap_insert(rep_rel, newtuple);
+		CatalogUpdateIndexes(rep_rel, newtuple);
+	}
+	else if (opflag == 1) {
+		newtuple = heap_modify_tuple(newtuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
+		simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
+		CatalogUpdateIndexes(rep_rel, newtuple);
+	}
+	heap_close(rep_rel, NoLock);
+}
+
+void
+insertPteHash(PeerTxnEntry *pte)
+{
+	PteOriginHashEntry    *rorigin    = NULL;
+	PteLocalXidHashEntry  *rlocalxid  = NULL;
+	PteLocalCoidHashEntry *rlocalcoid = NULL;
+	int8                   skorigin;
+	int4                   sklocalxid;
+	int4                   sklocalcoid;
+	bool                   found;
+
+	skorigin = FORM_ORIGIN_NODE_ID_XID(pte->origin_node_id, pte->origin_xid);
+	hash_search(PteOriginHash, &skorigin, HASH_REMOVE, &found);
+	rorigin = (PteOriginHashEntry*)hash_search(PteOriginHash, &skorigin,
+	                                           HASH_ENTER, &found);
+	rorigin->pte = pte;
+
+	sklocalxid = pte->local_xid;
+	hash_search(PteLocalXidHash, &sklocalxid, HASH_REMOVE, &found);
+	rlocalxid = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &sklocalxid,
+	                                               HASH_ENTER, &found);
+	rlocalxid->pte = pte;
+
+	sklocalcoid = pte->local_coid;
+	hash_search(PteLocalCoidHash, &sklocalcoid, HASH_REMOVE, &found);
+	rlocalcoid = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &sklocalcoid,
+	                                                 HASH_ENTER, &found);
+	rlocalcoid->pte = pte;
+}
+
+void
+deletePteHash(PeerTxnEntry *pte)
+{
+	int8 skorigin;
+	int4 sklocalxid;
+	int4 sklocalcoid;
+	bool found;
+
+	skorigin = FORM_ORIGIN_NODE_ID_XID(pte->origin_node_id, pte->origin_xid);
+	hash_search(PteOriginHash, &skorigin, HASH_REMOVE, &found);
+
+	sklocalxid = pte->local_xid;
+	hash_search(PteLocalXidHash, &sklocalxid, HASH_REMOVE, &found);
+
+	sklocalcoid = pte->local_coid;
+	hash_search(PteLocalCoidHash, &sklocalcoid, HASH_REMOVE, &found);
 }
 
 void
@@ -360,6 +522,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		}
 
 		pte->local_coid = local_coid;
+		insertPteHash(pte);
 
 		SpinLockRelease(&rctl->ptxn_lock);
 	}
@@ -396,6 +559,7 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 		}
 
 		pte->local_xid = local_xid;
+		insertPteHash(pte);
 
 		SpinLockRelease(&rctl->ptxn_lock);
 	}
@@ -403,7 +567,7 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 }
 
 void
-erase_transaction(NodeId origin_node_id, TransactionId origin_xid)
+erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commit)
 {
 	PeerTxnEntry   *pte;
 
@@ -419,15 +583,12 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid)
 
 		SpinLockAcquire(&rctl->ptxn_lock);
 
-		while(1) {
-			pte = find_entry_for(origin_node_id, origin_xid);
-			if (pte)
-			{
-				pte->origin_node_id = InvalidNodeId;
-				pte->valid = false;
-			}
-			else
-				break;
+		pte = find_entry_for(origin_node_id, origin_xid);
+		if (pte)
+		{
+			deletePteHash(pte);
+			pte->origin_node_id = InvalidNodeId;
+			pte->valid = false;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -439,8 +600,15 @@ void
 get_origin_by_local_xid(TransactionId local_xid,
 						NodeId *origin_node_id, TransactionId *origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
+	int			   i;
+	PeerTxnEntry  *pte;
+	Relation       rep_rel = NULL;
+	Relation       idx_rel = NULL;
+	IndexScanDesc  scan;
+	ScanKey        skeys;
+	HeapTuple      tuple;
+	bool           found   = false;
+	bool           isnull;
 
 	Assert(TransactionIdIsValid(local_xid));
 
@@ -484,11 +652,33 @@ get_origin_by_local_xid(TransactionId local_xid,
 			{
 				*origin_node_id = pte[i].origin_node_id;
 				*origin_xid = pte[i].origin_xid;
+				found = true;
 				break;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+
+		if (!found) {
+			/* Not found in shmem, now try pg_replication */
+			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
+			            pg_replication_eq_func, local_xid);
+			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
+			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+			tuple = index_getnext(scan, ForwardScanDirection);
+			if (tuple) {
+				*origin_node_id = fastgetattr(tuple, Anum_pg_replication_reporiginnodeid,
+				                              rep_rel->rd_att, &isnull);
+				*origin_xid = fastgetattr(tuple, Anum_pg_replication_reporiginxid,
+				                          rep_rel->rd_att, &isnull);
+			}
+			index_endscan(scan);
+			pfree(skeys);
+			index_close(idx_rel, NoLock);
+			heap_close(rep_rel, NoLock);
+		}
 	}
 	END_CRIT_SECTION();
 }
@@ -497,8 +687,15 @@ get_origin_by_local_xid(TransactionId local_xid,
 void
 get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
+	int			   i;
+	PeerTxnEntry  *pte;
+	Relation       rep_rel = NULL;
+	Relation       idx_rel = NULL;
+	IndexScanDesc  scan;
+	ScanKey        skeys;
+	HeapTuple      tuple;
+	bool           found   = false;
+	bool           isnull;
 
 	*local_xid = InvalidTransactionId;
 
@@ -524,11 +721,31 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 			if (pte[i].local_coid == coid)
 			{
 				*local_xid = pte[i].local_xid;
+				found = true;
 				break;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+
+		if (!found) {
+			/* Not found in shmem, now try pg_replication */
+			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
+			            pg_replication_eq_func, coid);
+			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+			idx_rel = index_open(ReplicationCoidIndexId, AccessShareLock);
+			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+			tuple = index_getnext(scan, ForwardScanDirection);
+			if (tuple) {
+				*local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
+				                         rep_rel->rd_att, &isnull);
+			}
+			index_endscan(scan);
+			pfree(skeys);
+			index_close(idx_rel, NoLock);
+			heap_close(rep_rel, NoLock);
+		}
 	}
 	END_CRIT_SECTION();
 }
@@ -536,9 +753,16 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 CommitOrderId
 get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-	CommitOrderId   coid = InvalidCommitOrderId;
+	int			   i;
+	PeerTxnEntry  *pte;
+	CommitOrderId  coid    = InvalidCommitOrderId;
+	Relation       rep_rel = NULL;
+	Relation       idx_rel = NULL;
+	IndexScanDesc  scan;
+	ScanKey        skeys;
+	HeapTuple      tuple;
+	bool           found   = false;
+	bool           isnull;
 
 	START_CRIT_SECTION();
 	{
@@ -563,11 +787,33 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 				(pte[i].origin_xid == origin_xid))
 			{
 				coid = pte[i].local_coid;
+				found = true;
 				break;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+
+		if (!found) {
+			/* Not found in shmem, now try pg_replication */
+			skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
+			            pg_replication_eq_func, origin_node_id);
+			ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber,
+			            pg_replication_eq_func, origin_xid);
+			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+			idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+			tuple = index_getnext(scan, ForwardScanDirection);
+			if (tuple) {
+				coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+				                   rep_rel->rd_att, &isnull);
+			}
+			index_endscan(scan);
+			pfree(skeys);
+			index_close(idx_rel, NoLock);
+			heap_close(rep_rel, NoLock);
+		}
 	}
 	END_CRIT_SECTION();
 
@@ -577,9 +823,16 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 CommitOrderId
 get_local_coid_by_local_xid(TransactionId local_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-	CommitOrderId   coid = InvalidCommitOrderId;
+	int			   i;
+	PeerTxnEntry  *pte;
+	CommitOrderId  coid    = InvalidCommitOrderId;
+	Relation       rep_rel = NULL;
+	Relation       idx_rel = NULL;
+	IndexScanDesc  scan;
+	ScanKey        skeys;
+	HeapTuple      tuple;
+	bool           found   = false;
+	bool           isnull;
 
 	START_CRIT_SECTION();
 	{
@@ -603,11 +856,31 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 			if (pte[i].local_xid == local_xid)
 			{
 				coid = pte[i].local_coid;
+				found = true;
 				break;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+
+		if (!found) {
+			/* Not found in shmem, now try pg_replication */
+			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
+			            pg_replication_eq_func, local_xid);
+			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
+			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+			tuple = index_getnext(scan, ForwardScanDirection);
+			if (tuple) {
+				coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+				                   rep_rel->rd_att, &isnull);
+			}
+			index_endscan(scan);
+			pfree(skeys);
+			index_close(idx_rel, NoLock);
+			heap_close(rep_rel, NoLock);
+		}
 	}
 	END_CRIT_SECTION();
 
@@ -619,50 +892,58 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 				TransactionId local_xid,
 				NodeId origin_node_id, TransactionId origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-
-	bool			found_eff_coid = false,
-					found_req_coid = false;
+	bool		  found_eff_coid = false,
+		          found_req_coid = false;
+	CommitOrderId r1, r2;
 
 	*eff_coid = KnownGoodCommitOrderId;
 	*req_coid = KnownGoodCommitOrderId;
+
+	r1 = get_local_coid_by_local_xid(local_xid);
+	if (r1 == InvalidCommitOrderId) {
+		found_eff_coid = false;
+	}
+	else {
+		found_eff_coid = true;
+		*eff_coid = r1;
+	}
+
+	r2 = get_local_coid_by_origin(origin_node_id, origin_xid);
+	if (r2 == InvalidCommitOrderId) {
+		found_req_coid = false;
+	}
+	else {
+		found_req_coid = true;
+		*req_coid = r2;
+	}
+
+	if (found_eff_coid && !found_req_coid) {
+		*req_coid = *eff_coid;
+	}
+}
+
+CommitOrderId
+getLowestKnownCommitOrderId()
+{
+	int            i;
+	PeerTxnEntry  *pte;
+	CommitOrderId  ret = InvalidCommitOrderId;
 
 	START_CRIT_SECTION();
 	{
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
-
 		SpinLockAcquire(&rctl->ptxn_lock);
 
 		pte = (PeerTxnEntry*) &rctl[1];
-
-		/* we don't support wrapping, yet */
-		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-				 
-			if ((pte[i].origin_node_id != InvalidNodeId) &&
-				(pte[i].local_xid == local_xid))
-			{
-				*eff_coid = pte[i].local_coid;
-				if (found_req_coid)
-					break;
-				found_eff_coid = true;
-			}
-
-			if ((pte[i].origin_node_id == origin_node_id) &&
-				(pte[i].origin_xid == origin_xid))
-			{
-				*req_coid = pte[i].local_coid;
-				if (found_eff_coid)
-					break;
-				found_req_coid = true;
+		for (i=rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
+			if (pte[i].valid) {
+				if (ret == InvalidCommitOrderId) {
+					ret = pte[i].local_coid;
+				}
+				else if (pte[i].local_coid < ret) {
+					ret = pte[i].local_coid;
+				}
 			}
 		}
 
@@ -670,9 +951,7 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 	}
 	END_CRIT_SECTION();
 
-	if (found_eff_coid && !found_req_coid) {
-		*req_coid = *eff_coid;
-	}
+	return ret;
 }
 
 /*
@@ -686,10 +965,10 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 void
 WaitUntilCommittable(void)
 {
-	TransactionId   xid;
-	CommitOrderId   my_coid = InvalidCommitOrderId,
-		            dep_coid;
-	PeerTxnEntry   *pte;
+	TransactionId  xid;
+	CommitOrderId  my_coid = InvalidCommitOrderId,
+		           dep_coid;
+	PeerTxnEntry  *pte;
 
 	/*
 	 * Short circuit for aborted transactions.
@@ -704,18 +983,7 @@ WaitUntilCommittable(void)
 	/*
 	 * Lookup the lowest known commit order id
 	 */
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-		SpinLockAcquire(&rctl->ptxn_lock);
-
-		pte = (PeerTxnEntry*) &rctl[1];
-		dep_coid = pte[rctl->ptxn_tail].local_coid;
-
-		SpinLockRelease(&rctl->ptxn_lock);
-	}
-	END_CRIT_SECTION();
+	dep_coid = getLowestKnownCommitOrderId();
 
 	/*
 	 * Loop over all transactions with commit order ids in between the
