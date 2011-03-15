@@ -328,6 +328,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	ShmemIndexEnt *result;
 	void	   *structPtr;
 
+	/* printf("About to alloc shmem for %s size %d ...", name, size); */
+
 	LWLockAcquire(ShmemIndexLock, LW_EXCLUSIVE);
 
 	if (!ShmemIndex)
@@ -423,6 +425,9 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	LWLockRelease(ShmemIndexLock);
 
 	Assert(ShmemAddrIsValid(structPtr));
+
+	/* printf("done.\n"); */
+
 	return structPtr;
 }
 

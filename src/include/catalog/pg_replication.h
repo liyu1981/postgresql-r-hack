@@ -33,10 +33,10 @@
 
 CATALOG(pg_replication,8888)
 {
-	uint32 reporiginnodeid;     /* origin_node_id */
-	uint32 reporiginxid;        /* origin_xid */
-	uint32 replocalxid;         /* local_xid */
-	uint32 replocalcoid;        /* local_coid */
+	int4 reporiginnodeid;     /* origin_node_id */
+	int4 reporiginxid;        /* origin_xid */
+	int4 replocalxid;         /* local_xid */
+	int4 replocalcoid;        /* local_coid */
 } FormData_pg_replication;
 
 /* ----------------

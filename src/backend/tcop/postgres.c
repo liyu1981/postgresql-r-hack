@@ -4310,7 +4310,7 @@ bgworker_commit_request(IMessage *msg)
 			CommitTransactionCommand();
 
 			bgworker_job_completed();
-			erase_transaction(origin_node_id, origin_xid);
+			erase_transaction(origin_node_id, origin_xid, true);
 
 			Assert(!TransactionIdIsValid(GetTopTransactionIdIfAny()));
 		}
@@ -4364,7 +4364,7 @@ bgworker_abort_request(IMessage *msg)
 
 	AbortOutOfAnyTransaction();
 
-	erase_transaction(origin_node_id, origin_xid);
+	erase_transaction(origin_node_id, origin_xid, false);
 
 	return true;
 }

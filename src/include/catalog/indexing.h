@@ -280,11 +280,11 @@ DECLARE_UNIQUE_INDEX(pg_default_acl_oid_index, 828, on pg_default_acl using btre
 DECLARE_UNIQUE_INDEX(pg_db_role_setting_databaseid_rol_index, 2965, on pg_db_role_setting using btree(setdatabase oid_ops, setrole oid_ops));
 #define DbRoleSettingDatidRolidIndexId	2965
 
-DECLARE_INDEX(pg_replication_origin_index, 8889, on pg_replication using hash(reporiginnodeid int4_ops, reporiginxid int4_ops));
+DECLARE_INDEX(pg_replication_origin_index, 8889, on pg_replication using btree(reporiginnodeid int4_ops, reporiginxid int4_ops));
 #define ReplicationOriginIndexId  8889
-DECLARE_INDEX(pg_replication_xid_index, 8890, on pg_replication using hash(replocalxid int4_ops));
+DECLARE_INDEX(pg_replication_xid_index, 8890, on pg_replication using btree(replocalxid int4_ops));
 #define ReplicationXidIndexId  8890
-DECLARE_INDEX(pg_replication_coid_index, 8891, on pg_replication using hash(replocalcoid int4_ops));
+DECLARE_INDEX(pg_replication_coid_index, 8891, on pg_replication using btree(replocalcoid int4_ops));
 #define ReplicationCoidIndexId  8891
 
 /* last step of initialization script: build the indexes declared above */

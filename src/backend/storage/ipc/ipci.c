@@ -132,7 +132,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, AsyncShmemSize());
 		size = add_size(size, IMessageShmemSize());
 #ifdef REPLICATION
-		size = add_size(size, ReplLutCtlShmemSize());
+	    size = add_size(size, ReplLutCtlShmemSize());
 #endif
 #ifdef EXEC_BACKEND
 		size = add_size(size, ShmemBackendArraySize());
