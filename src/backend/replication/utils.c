@@ -34,7 +34,8 @@
 #include "replication/cset.h"
 #include "replication/utils.h"
 
-#define PeerTxnEntries 1024
+/* #define PeerTxnEntries 1024 */
+#define PeerTxnEntries 2
 
 typedef struct PeerTxnEntry
 {
@@ -355,6 +356,7 @@ alloc_new_entry()
 		/* still have not used slot (only happens shortly after init) */
 		pte = (PeerTxnEntry*) &rctl[1];
 		pte = &pte[rctl->ptxn_head++];
+		elog(LOG, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
 		return pte;
 	}
 	else {
@@ -377,6 +379,7 @@ alloc_new_entry()
 					rctl->ptxn_laststop += 1;
 					if (rctl->ptxn_laststop >= rctl->ptxn_head)
 						rctl->ptxn_laststop = 0;
+					elog(LOG, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
 					return pte;
 				}
 			}
@@ -441,11 +444,13 @@ storePteToPgReplication(PeerTxnEntry *pte)
 	values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
 	values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
 	if (opflag == 0) {
+		elog(LOG, "storePteToPgReplication, inserted %d, %d", pte->origin_node_id, pte->origin_xid);
 		newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
 		simple_heap_insert(rep_rel, newtuple);
 		CatalogUpdateIndexes(rep_rel, newtuple);
 	}
 	else if (opflag == 1) {
+		elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
 		newtuple = heap_modify_tuple(newtuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
 		simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
 		CatalogUpdateIndexes(rep_rel, newtuple);
@@ -601,6 +606,7 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+		elog(LOG, "erase_transaction, is_commit=%d", is_commit);
 	}
 	END_CRIT_SECTION();
 }
