@@ -73,8 +73,9 @@ ReplLutCtlData *ReplLutCtl;
 HTAB           *PteOriginHash;
 HTAB           *PteLocalXidHash;
 HTAB           *PteLocalCoidHash;
-RegProcedure    pg_replication_eq_func = InvalidOid;
 
+uint32        PteOriginHashFunc(const void *key, Size keysize);
+uint32        PteLocalHashFunc(const void *key, Size keysize);
 void          InitPte(PeerTxnEntry *pte);
 int           ReplLutCtlShmemSize();
 void          InitSharedPeerTxnQueue();
@@ -84,7 +85,22 @@ void          storePteToPgReplication(PeerTxnEntry *pte);
 void          insertPteHash(PeerTxnEntry *pte);
 void          deletePteHash(PeerTxnEntry *pte);
 CommitOrderId getLowestKnownCommitOrderId();
-RegProcedure  getPgReplicationEqFunc();
+
+uint32
+PteOriginHashFunc(const void *key, Size keysize)
+{
+	int64  val    = *(int64*)key;
+	uint32 lohalf = (uint32) val;
+	uint32 hihalf = (uint32) (val >> 32);
+	lohalf ^= (val >= 0) ? hihalf : ~hihalf;
+	return hash_uint32(lohalf);
+}
+
+uint32
+PteLocalHashFunc(const void *key, Size keysize)
+{
+	return hash_uint32(*(uint32*)key);
+}
 
 char *
 decode_database_state(rdb_state state)
@@ -201,7 +217,7 @@ InitPteHash()
 		SpinLockAcquire(&rctl->origin_lock);
 		info.keysize = sizeof(int8);
 		info.entrysize = sizeof(PteOriginHashEntry);
-		info.hash = hashint8;
+		info.hash = PteOriginHashFunc;
 		PteOriginHash = ShmemInitHash("PteOriginHash",
 		                              PeerTxnEntries, PeerTxnEntries, &info,
 		                              HASH_ELEM | HASH_FUNCTION);
@@ -212,7 +228,7 @@ InitPteHash()
 		SpinLockAcquire(&rctl->localxid_lock);
 		info.keysize = sizeof(TransactionId);
 		info.entrysize = sizeof(PteLocalXidHashEntry);
-		info.hash = hashint4;
+		info.hash = PteLocalHashFunc;
 		PteLocalXidHash = ShmemInitHash("PteLocalxidHash",
 		                                PeerTxnEntries, PeerTxnEntries, &info,
 		                                HASH_ELEM | HASH_FUNCTION);
@@ -223,7 +239,7 @@ InitPteHash()
 		SpinLockAcquire(&rctl->localcoid_lock);
 		info.keysize = sizeof(TransactionId);
 		info.entrysize = sizeof(PteLocalCoidHashEntry);
-		info.hash = hashint4;
+		info.hash = PteLocalHashFunc;
 		PteLocalCoidHash = ShmemInitHash("PteLocalcoidHash",
 		                                 PeerTxnEntries, PeerTxnEntries, &info,
 		                                 HASH_ELEM | HASH_FUNCTION);
@@ -263,26 +279,6 @@ ReplLutShmemInit(void)
 	InitPteHash();
 }
 
-RegProcedure
-getPgReplicationEqFunc()
-{
-	Relation idx_rel;
-	Oid      eq_func_oid;
-
-	if (pg_replication_eq_func == InvalidOid) {
-		/* init pg_replication_eq_func.  liyu: this is possible because
-		   all 4 attrs in pg_replication are of type int32
-		*/
-		idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-		get_sort_group_operators(idx_rel->rd_att->attrs[0]->atttypid,
-		                         false, true, false,
-		                         NULL, &eq_func_oid, NULL);
-		pg_replication_eq_func = get_opcode(eq_func_oid);
-		index_close(idx_rel, NoLock);
-	}
-	return pg_replication_eq_func;
-}
-
 static PeerTxnEntry *
 find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 {
@@ -320,8 +316,8 @@ find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 
 	pte = NULL;
 	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, get_opcode(eq_func), origin_node_id);
-	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, get_opcode(eq_func), origin_xid);
+	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
+	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
 	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
 	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
@@ -414,8 +410,8 @@ storePteToPgReplication(PeerTxnEntry *pte)
 
 	/* search for the old tuple first */
 	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, getPgReplicationEqFunc(), pte->origin_node_id);
-	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, getPgReplicationEqFunc(), pte->origin_xid);
+	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, pte->origin_node_id);
+	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, pte->origin_xid);
 	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
 	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
@@ -677,8 +673,7 @@ get_origin_by_local_xid(TransactionId local_xid,
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
 			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
-			            getPgReplicationEqFunc(), local_xid);
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
 			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
 			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
@@ -746,8 +741,7 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
 			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
-			            getPgReplicationEqFunc(), coid);
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, coid);
 			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 			idx_rel = index_open(ReplicationCoidIndexId, AccessShareLock);
 			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
@@ -812,10 +806,8 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
 			skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
-			            getPgReplicationEqFunc(), origin_node_id);
-			ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber,
-			            getPgReplicationEqFunc(), origin_xid);
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
+			ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
 			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 			idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
 			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
@@ -881,8 +873,7 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
 			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber,
-			            getPgReplicationEqFunc(), local_xid);
+			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
 			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
 			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
 			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
