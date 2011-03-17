@@ -73,6 +73,7 @@
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "libpq/pqsignal.h"
@@ -655,10 +656,11 @@ populate_co_databases()
 NON_EXEC_STATIC void
 CoordinatorMain(int argc, char *argv[])
 {
-	sigjmp_buf	local_sigjmp_buf;
-	IMessage   *msg = NULL;
-	bool        can_launch;
-	int         ret;
+	sigjmp_buf     local_sigjmp_buf;
+	IMessage      *msg = NULL;
+	bool           can_launch;
+	int            ret;
+	MemoryContext  oldcxt;
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
@@ -736,6 +738,17 @@ CoordinatorMain(int argc, char *argv[])
 #endif
 
 	InitPostgres(NULL, InvalidOid, NULL, NULL);
+
+	/* liyu: Dirty hack!! Now we need to access template1 database,
+	 * just dirty assign the MyDatabaseID variable. */
+	MyDatabaseId = TemplateDbOid;
+	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+	StartTransactionCommand();
+	GetTransactionSnapshot();
+	SetDatabasePath(GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace));
+	RelationCacheInitializePhase3();
+	CommitTransactionCommand();
+	elog(LOG, "MyDatabaseId=%d", MyDatabaseId);
 
 	SetProcessingMode(NormalProcessing);
 
