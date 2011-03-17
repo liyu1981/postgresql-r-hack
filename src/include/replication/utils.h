@@ -16,6 +16,8 @@
 #include "nodes/nodes.h"
 #include "storage/proc.h"
 
+#define REPLICATION_PRINT_MEMORY(pointer, size, withchar) 
+/*
 #define REPLICATION_PRINT_MEMORY(pointer, size, withchar)	  \
 	{ \
 	    printf("%%%%% Memory start from %x: \n", (pointer)); \
@@ -31,6 +33,7 @@
 		printf("\n"); \
 	    printf("%%%%% \n"); \
     }
+*/
 
 /* helper function in coordinator.c */
 extern void *std_memory_context_alloc(size_t size);

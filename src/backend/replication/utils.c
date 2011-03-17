@@ -33,6 +33,7 @@
 #include "replication/replication.h"
 #include "replication/cset.h"
 #include "replication/utils.h"
+#include "utils/fmgroids.h"
 
 /* #define PeerTxnEntries 1024 */
 #define PeerTxnEntries 2
