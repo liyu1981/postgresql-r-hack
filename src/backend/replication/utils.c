@@ -69,6 +69,18 @@ typedef struct PteLocalCoidHashEntry
 	PeerTxnEntry  *pte;
 } PteLocalCoidHashEntry;
 
+#define BEGIN_SYSTAB_ACCESS_BLOCK() \
+	{ \
+	    if (!IsTransactionBlock()) \
+		    StartTransactionCommand(); \
+    } \
+
+#define END_SYSTAB_ACCESS_BLOCK() \
+	{ \
+	    if (!IsTransactionBlock()) \
+		    CommitTransactionCommand(); \
+    }
+
 /* globals keeping pointers to the shmem areas */
 ReplLutCtlData *ReplLutCtl;
 HTAB           *PteOriginHash;
@@ -316,27 +328,31 @@ find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 	 */
 
 	pte = NULL;
-	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
-	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
-	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-	tuple = index_getnext(scan, ForwardScanDirection);
-	if (tuple) {
-		pte = alloc_new_entry();
-		pte->origin_node_id = origin_node_id;
-		pte->origin_xid = origin_xid;
-		pte->valid = true;
-		pte->local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
-		                             rep_rel->rd_att, &isnull);
-		pte->local_coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-		                              rep_rel->rd_att, &isnull);
+	BEGIN_SYSTAB_ACCESS_BLOCK();
+	{
+		skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+		ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
+		ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
+		rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+		idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+		scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+		tuple = index_getnext(scan, ForwardScanDirection);
+		if (tuple) {
+			pte = alloc_new_entry();
+			pte->origin_node_id = origin_node_id;
+			pte->origin_xid = origin_xid;
+			pte->valid = true;
+			pte->local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
+			                             rep_rel->rd_att, &isnull);
+			pte->local_coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+			                              rep_rel->rd_att, &isnull);
+		}
+		index_endscan(scan);
+		pfree(skeys);
+		index_close(idx_rel, NoLock);
+		heap_close(rep_rel, NoLock);
 	}
-	index_endscan(scan);
-	pfree(skeys);
-	index_close(idx_rel, NoLock);
-	heap_close(rep_rel, NoLock);
+	END_SYSTAB_ACCESS_BLOCK();
 
 	return pte;
 }
@@ -410,49 +426,57 @@ storePteToPgReplication(PeerTxnEntry *pte)
 	bool          doReplace[Natts_pg_replication];
 
 	/* search for the old tuple first */
-	skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-	ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, pte->origin_node_id);
-	ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, pte->origin_xid);
-	rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-	idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-	scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-	tuple = index_getnext(scan, ForwardScanDirection);
-	if (tuple) {
-		/* already have a record, but the old one is useless now */
-		newtuple = heap_copytuple(tuple);
-		opflag = 1;
+	BEGIN_SYSTAB_ACCESS_BLOCK();
+	{
+		skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+		ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, pte->origin_node_id);
+		ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, pte->origin_xid);
+		rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+		idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+		scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+		tuple = index_getnext(scan, ForwardScanDirection);
+		if (tuple) {
+			/* already have a record, but the old one is useless now */
+			newtuple = heap_copytuple(tuple);
+			opflag = 1;
+		}
+		else {
+			/* record not exist, so we insert new one */
+			opflag = 0;
+		}
+		index_endscan(scan);
+		pfree(skeys);
+		index_close(idx_rel, NoLock);
+		heap_close(rep_rel, NoLock);
 	}
-	else {
-		/* record not exist, so we insert new one */
-		opflag = 0;
-	}
-	index_endscan(scan);
-	pfree(skeys);
-	index_close(idx_rel, NoLock);
-	heap_close(rep_rel, NoLock);
+	END_SYSTAB_ACCESS_BLOCK();
 
 	/* now either insert or update */
-	rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-	memset(doReplace, true, sizeof(doReplace));
-	values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
-	values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
-	values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
-	values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
-	if (opflag == 0) {
-		elog(LOG, "storePteToPgReplication, inserted %d, %d", pte->origin_node_id, pte->origin_xid);
-		newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
-		simple_heap_insert(rep_rel, newtuple);
-		CatalogUpdateIndexes(rep_rel, newtuple);
+	BEGIN_SYSTAB_ACCESS_BLOCK();
+	{
+		rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
+		memset(values, 0, sizeof(values));
+		memset(nulls, false, sizeof(nulls));
+		memset(doReplace, true, sizeof(doReplace));
+		values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
+		values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
+		values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
+		values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
+		if (opflag == 0) {
+			elog(LOG, "storePteToPgReplication, inserted %d, %d", pte->origin_node_id, pte->origin_xid);
+			newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
+			simple_heap_insert(rep_rel, newtuple);
+			CatalogUpdateIndexes(rep_rel, newtuple);
+		}
+		else if (opflag == 1) {
+			elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
+			newtuple = heap_modify_tuple(newtuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
+			simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
+			CatalogUpdateIndexes(rep_rel, newtuple);
+		}
+		heap_close(rep_rel, NoLock);
 	}
-	else if (opflag == 1) {
-		elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
-		newtuple = heap_modify_tuple(newtuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
-		simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
-		CatalogUpdateIndexes(rep_rel, newtuple);
-	}
-	heap_close(rep_rel, NoLock);
+	END_SYSTAB_ACCESS_BLOCK();
 }
 
 void
@@ -673,22 +697,26 @@ get_origin_by_local_xid(TransactionId local_xid,
 
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
-			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
-			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
-			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-			tuple = index_getnext(scan, ForwardScanDirection);
-			if (tuple) {
-				*origin_node_id = fastgetattr(tuple, Anum_pg_replication_reporiginnodeid,
-				                              rep_rel->rd_att, &isnull);
-				*origin_xid = fastgetattr(tuple, Anum_pg_replication_reporiginxid,
-				                          rep_rel->rd_att, &isnull);
+			BEGIN_SYSTAB_ACCESS_BLOCK();
+			{
+				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
+				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+				idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
+				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+				tuple = index_getnext(scan, ForwardScanDirection);
+				if (tuple) {
+					*origin_node_id = fastgetattr(tuple, Anum_pg_replication_reporiginnodeid,
+					                              rep_rel->rd_att, &isnull);
+					*origin_xid = fastgetattr(tuple, Anum_pg_replication_reporiginxid,
+					                          rep_rel->rd_att, &isnull);
+				}
+				index_endscan(scan);
+				pfree(skeys);
+				index_close(idx_rel, NoLock);
+				heap_close(rep_rel, NoLock);
 			}
-			index_endscan(scan);
-			pfree(skeys);
-			index_close(idx_rel, NoLock);
-			heap_close(rep_rel, NoLock);
+			END_SYSTAB_ACCESS_BLOCK();
 		}
 	}
 	END_CRIT_SECTION();
@@ -741,20 +769,24 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
-			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, coid);
-			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-			idx_rel = index_open(ReplicationCoidIndexId, AccessShareLock);
-			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-			tuple = index_getnext(scan, ForwardScanDirection);
-			if (tuple) {
-				*local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
-				                         rep_rel->rd_att, &isnull);
+			BEGIN_SYSTAB_ACCESS_BLOCK();
+			{
+				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, coid);
+				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+				idx_rel = index_open(ReplicationCoidIndexId, AccessShareLock);
+				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+				tuple = index_getnext(scan, ForwardScanDirection);
+				if (tuple) {
+					*local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
+					                         rep_rel->rd_att, &isnull);
+				}
+				index_endscan(scan);
+				pfree(skeys);
+				index_close(idx_rel, NoLock);
+				heap_close(rep_rel, NoLock);
 			}
-			index_endscan(scan);
-			pfree(skeys);
-			index_close(idx_rel, NoLock);
-			heap_close(rep_rel, NoLock);
+			END_SYSTAB_ACCESS_BLOCK();
 		}
 	}
 	END_CRIT_SECTION();
@@ -806,21 +838,25 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
-			skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
-			ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
-			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-			idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-			tuple = index_getnext(scan, ForwardScanDirection);
-			if (tuple) {
-				coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-				                   rep_rel->rd_att, &isnull);
+			BEGIN_SYSTAB_ACCESS_BLOCK();
+			{
+				skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
+				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
+				ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
+				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+				idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
+				tuple = index_getnext(scan, ForwardScanDirection);
+				if (tuple) {
+					coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+					                   rep_rel->rd_att, &isnull);
+				}
+				index_endscan(scan);
+				pfree(skeys);
+				index_close(idx_rel, NoLock);
+				heap_close(rep_rel, NoLock);
 			}
-			index_endscan(scan);
-			pfree(skeys);
-			index_close(idx_rel, NoLock);
-			heap_close(rep_rel, NoLock);
+			END_SYSTAB_ACCESS_BLOCK();
 		}
 	}
 	END_CRIT_SECTION();
@@ -873,20 +909,24 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 
 		if (!found) {
 			/* Not found in shmem, now try pg_replication */
-			skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-			ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
-			rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-			idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
-			scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-			tuple = index_getnext(scan, ForwardScanDirection);
-			if (tuple) {
-				coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-				                   rep_rel->rd_att, &isnull);
+			BEGIN_SYSTAB_ACCESS_BLOCK();
+			{
+				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
+				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
+				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
+				idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
+				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
+				tuple = index_getnext(scan, ForwardScanDirection);
+				if (tuple) {
+					coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
+					                   rep_rel->rd_att, &isnull);
+				}
+				index_endscan(scan);
+				pfree(skeys);
+				index_close(idx_rel, NoLock);
+				heap_close(rep_rel, NoLock);
 			}
-			index_endscan(scan);
-			pfree(skeys);
-			index_close(idx_rel, NoLock);
-			heap_close(rep_rel, NoLock);
+			END_SYSTAB_ACCESS_BLOCK();
 		}
 	}
 	END_CRIT_SECTION();
