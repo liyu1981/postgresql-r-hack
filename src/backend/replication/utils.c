@@ -71,13 +71,17 @@ typedef struct PteLocalCoidHashEntry
 
 #define BEGIN_SYSTAB_ACCESS_BLOCK() \
 	{ \
-	    if (!IsTransactionBlock()) \
+		if (TransactionBlockStatusCode() == 'I') \
 		    StartTransactionCommand(); \
+		if (afterTriggers == NULL) { \
+			AfterTriggerBeginXact(); \
+		} \
     } \
 
+	/* if (!IsTransactionBlock()) \ */
 #define END_SYSTAB_ACCESS_BLOCK() \
 	{ \
-	    if (!IsTransactionBlock()) \
+		if (TransactionBlockStatusCode() == 'T') \
 		    CommitTransactionCommand(); \
     }
 
@@ -431,49 +435,43 @@ storePteToPgReplication(PeerTxnEntry *pte)
 		skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
 		ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, pte->origin_node_id);
 		ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, pte->origin_xid);
-		rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-		idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
+		rep_rel = heap_open(ReplicationRelationId, ExclusiveLock);
+		idx_rel = index_open(ReplicationOriginIndexId, ExclusiveLock);
 		scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
 		tuple = index_getnext(scan, ForwardScanDirection);
-		if (tuple) {
+		if (tuple && HeapTupleIsValid(tuple)) {
 			/* already have a record, but the old one is useless now */
-			newtuple = heap_copytuple(tuple);
-			opflag = 1;
+			rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
+			memset(values, 0, sizeof(values));
+			memset(nulls, false, sizeof(nulls));
+			memset(doReplace, true, sizeof(doReplace));
+			values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
+			values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
+			values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
+			values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
+			elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
+			newtuple = heap_modify_tuple(tuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
+			simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
+			CatalogUpdateIndexes(rep_rel, newtuple);
 		}
 		else {
 			/* record not exist, so we insert new one */
-			opflag = 0;
-		}
-		index_endscan(scan);
-		pfree(skeys);
-		index_close(idx_rel, NoLock);
-		heap_close(rep_rel, NoLock);
-	}
-	END_SYSTAB_ACCESS_BLOCK();
-
-	/* now either insert or update */
-	BEGIN_SYSTAB_ACCESS_BLOCK();
-	{
-		rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
-		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
-		memset(doReplace, true, sizeof(doReplace));
-		values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
-		values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
-		values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
-		values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
-		if (opflag == 0) {
+			rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
+			memset(values, 0, sizeof(values));
+			memset(nulls, false, sizeof(nulls));
+			memset(doReplace, true, sizeof(doReplace));
+			values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
+			values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
+			values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
+			values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
 			elog(LOG, "storePteToPgReplication, inserted %d, %d", pte->origin_node_id, pte->origin_xid);
 			newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
 			simple_heap_insert(rep_rel, newtuple);
 			CatalogUpdateIndexes(rep_rel, newtuple);
 		}
-		else if (opflag == 1) {
-			elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
-			newtuple = heap_modify_tuple(newtuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
-			simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
-			CatalogUpdateIndexes(rep_rel, newtuple);
-		}
+		index_endscan(scan);
+		pfree(skeys);
+		index_close(idx_rel, NoLock);
 		heap_close(rep_rel, NoLock);
 	}
 	END_SYSTAB_ACCESS_BLOCK();
