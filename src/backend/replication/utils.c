@@ -45,8 +45,8 @@ typedef struct PeerTxnEntry
 	TransactionId	local_xid;
 	CommitOrderId	local_coid;
 	bool            valid;
+	bool            commited;
 	bool            aborted;
-	bool            tic;
 } PeerTxnEntry;
 
 typedef struct PteOriginHashEntry
@@ -68,22 +68,6 @@ typedef struct PteLocalCoidHashEntry
 	TransactionId  local_coid;
 	PeerTxnEntry  *pte;
 } PteLocalCoidHashEntry;
-
-#define BEGIN_SYSTAB_ACCESS_BLOCK() \
-	{ \
-		if (TransactionBlockStatusCode() == 'I') \
-		    StartTransactionCommand(); \
-		if (afterTriggers == NULL) { \
-			AfterTriggerBeginXact(); \
-		} \
-    } \
-
-	/* if (!IsTransactionBlock()) \ */
-#define END_SYSTAB_ACCESS_BLOCK() \
-	{ \
-		if (TransactionBlockStatusCode() == 'T') \
-		    CommitTransactionCommand(); \
-    }
 
 /* globals keeping pointers to the shmem areas */
 ReplLutCtlData *ReplLutCtl;
@@ -162,7 +146,7 @@ initPte(PeerTxnEntry *pte)
 {
 	pte->origin_node_id = InvalidNodeId;
 	pte->valid = false;
-	pte->tic = false;
+	pte->commited = false;
 	pte->aborted = false;
 }
 
@@ -299,64 +283,17 @@ ReplLutShmemInit(void)
 static PeerTxnEntry *
 find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 {
-	volatile ReplLutCtlData *rctl    = ReplLutCtl;
-	PeerTxnEntry			*pte     = (PeerTxnEntry*) &rctl[1];
-	int						 i;
-	Relation                 rep_rel = NULL;
-	Relation                 idx_rel = NULL;
-	Oid                      eq_func;
-	IndexScanDesc            scan;
-	ScanKey                  skeys;
-	HeapTuple                tuple;
-	int8                     search_key;
-	bool                     found;
-	void                    *ret;
-	bool                     isnull;
-
-	/*
-	  liyu: now this is a hash search.
-	 */
+	PeerTxnEntry *pte = NULL;
+	int8          search_key;
+	bool          found;
+	void         *ret;
 
 	search_key = FORM_ORIGIN_NODE_ID_XID(origin_node_id, origin_xid);
 	found = false;
 	ret = hash_search(PteOriginHash, &search_key, HASH_FIND, &found);
 	if (ret != NULL) {
 		pte = ((PteOriginHashEntry*)ret)->pte;
-		return pte;
 	}
-
-	/*
-	  liyu: Now we have a system table pg_replication store the last
-	  committed origin-local combination. So if we do not find
-	  anything in the shmem list, we have to search the system table.
-	 */
-
-	pte = NULL;
-	BEGIN_SYSTAB_ACCESS_BLOCK();
-	{
-		skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-		ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
-		ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
-		rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-		idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-		scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-		tuple = index_getnext(scan, ForwardScanDirection);
-		if (tuple) {
-			pte = alloc_new_entry();
-			pte->origin_node_id = origin_node_id;
-			pte->origin_xid = origin_xid;
-			pte->valid = true;
-			pte->local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
-			                             rep_rel->rd_att, &isnull);
-			pte->local_coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-			                              rep_rel->rd_att, &isnull);
-		}
-		index_endscan(scan);
-		pfree(skeys);
-		index_close(idx_rel, NoLock);
-		heap_close(rep_rel, NoLock);
-	}
-	END_SYSTAB_ACCESS_BLOCK();
 
 	return pte;
 }
@@ -366,115 +303,40 @@ alloc_new_entry()
 {
 	PeerTxnEntry            *pte;
 	volatile ReplLutCtlData *rctl = ReplLutCtl;
-	int                      i, old_laststop;
-	bool                     pass;
+	int                      i;
+	PeerTxnEntry            *ret;
+	bool                     found;
 
 	if (rctl->ptxn_head < PeerTxnEntries) {
 		/* still have not used slot (only happens shortly after init) */
 		pte = (PeerTxnEntry*) &rctl[1];
-		pte = &pte[rctl->ptxn_head++];
+		ret = &pte[rctl->ptxn_head++];
 		elog(LOG, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
-		return pte;
 	}
 	else {
-		/* usual case, here we apply a clock algorithm to swap in-valid slot */
-		old_laststop = rctl->ptxn_laststop;
-		pass = false;
-		while(true) {
-			pte = (PeerTxnEntry*)&rctl[rctl->ptxn_laststop];
-			if (!pte->valid) {
-				if (!pte->tic) {
-					pte->tic = true;
-					rctl->ptxn_laststop += 1;
-					if (rctl->ptxn_laststop >= rctl->ptxn_head)
-						rctl->ptxn_laststop = 0;
-				}
-				else {
-					if (!pte->aborted)
-						storePteToPgReplication(pte);
-					initPte(pte);
-					rctl->ptxn_laststop += 1;
-					if (rctl->ptxn_laststop >= rctl->ptxn_head)
-						rctl->ptxn_laststop = 0;
-					elog(LOG, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
-					return pte;
-				}
+		/* usual case, here we have to apply some algorithm to evict some slots */
+		/* FIXME: NOT DONE! */
+		pte = (PeerTxnEntry*) &rctl[1];
+		i = rctl->ptxn_tail;
+		found = false;
+		while(i<rctl->ptxn_head) {
+			if (!pte[i].valid) {
+				ret = &pte[i];
+				break;
 			}
-			if (rctl->ptxn_laststop == old_laststop) {
-				if (!pass)
-					pass = true;
-				else {
-					/* we have done two round search, no in-valid slot now, must return */
-					break;
-				}
-			}
+			i++;
 		}
+
+		if (!found)
+			ret = NULL;
 	}
 
-	return NULL;
+	return ret;
 }
 
 void
 storePteToPgReplication(PeerTxnEntry *pte)
 {
-	int			  i;
-	Relation      rep_rel = NULL;
-	Relation      idx_rel = NULL;
-	IndexScanDesc scan;
-	ScanKey       skeys;
-	HeapTuple     tuple;
-	HeapTuple     newtuple;
-	int           opflag;       /* 0 - insert, 1 - update */
-	Datum         values[Natts_pg_replication];
-	bool          nulls[Natts_pg_replication];
-	bool          doReplace[Natts_pg_replication];
-
-	/* search for the old tuple first */
-	BEGIN_SYSTAB_ACCESS_BLOCK();
-	{
-		skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-		ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, pte->origin_node_id);
-		ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, pte->origin_xid);
-		rep_rel = heap_open(ReplicationRelationId, ExclusiveLock);
-		idx_rel = index_open(ReplicationOriginIndexId, ExclusiveLock);
-		scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-		tuple = index_getnext(scan, ForwardScanDirection);
-		if (tuple && HeapTupleIsValid(tuple)) {
-			/* already have a record, but the old one is useless now */
-			rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
-			memset(values, 0, sizeof(values));
-			memset(nulls, false, sizeof(nulls));
-			memset(doReplace, true, sizeof(doReplace));
-			values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
-			values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
-			values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
-			values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
-			elog(LOG, "storePteToPgReplication, updated %d, %d", pte->origin_node_id, pte->origin_xid);
-			newtuple = heap_modify_tuple(tuple, RelationGetDescr(rep_rel), values, nulls, doReplace);
-			simple_heap_update(rep_rel, &newtuple->t_self, newtuple);
-			CatalogUpdateIndexes(rep_rel, newtuple);
-		}
-		else {
-			/* record not exist, so we insert new one */
-			rep_rel = heap_open(ReplicationRelationId, RowExclusiveLock);
-			memset(values, 0, sizeof(values));
-			memset(nulls, false, sizeof(nulls));
-			memset(doReplace, true, sizeof(doReplace));
-			values[Anum_pg_replication_reporiginnodeid - 1] = Int32GetDatum(pte->origin_node_id);
-			values[Anum_pg_replication_reporiginxid - 1] = TransactionIdGetDatum(pte->origin_xid);
-			values[Anum_pg_replication_replocalxid - 1] = TransactionIdGetDatum(pte->local_xid);
-			values[Anum_pg_replication_replocalcoid -1] = TransactionIdGetDatum(pte->local_coid);
-			elog(LOG, "storePteToPgReplication, inserted %d, %d", pte->origin_node_id, pte->origin_xid);
-			newtuple = heap_form_tuple(RelationGetDescr(rep_rel), values, nulls);
-			simple_heap_insert(rep_rel, newtuple);
-			CatalogUpdateIndexes(rep_rel, newtuple);
-		}
-		index_endscan(scan);
-		pfree(skeys);
-		index_close(idx_rel, NoLock);
-		heap_close(rep_rel, NoLock);
-	}
-	END_SYSTAB_ACCESS_BLOCK();
 }
 
 void
@@ -543,12 +405,15 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
+		while(true) {
 		SpinLockAcquire(&rctl->ptxn_lock);
 
 		pte = find_entry_for(origin_node_id, origin_xid);
 		if (!pte)
 		{
 			pte = alloc_new_entry();
+			if (!pte) {
+			}
 			pte->origin_node_id = origin_node_id;
 			pte->origin_xid = origin_xid;
 			pte->local_xid = InvalidTransactionId;
@@ -558,6 +423,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		insertPteHash(pte);
 
 		SpinLockRelease(&rctl->ptxn_lock);
+		}
 	}
 	END_CRIT_SECTION();
 }
@@ -634,15 +500,10 @@ void
 get_origin_by_local_xid(TransactionId local_xid,
 						NodeId *origin_node_id, TransactionId *origin_xid)
 {
-	int			   i;
-	PeerTxnEntry  *pte;
-	Relation       rep_rel = NULL;
-	Relation       idx_rel = NULL;
-	IndexScanDesc  scan;
-	ScanKey        skeys;
-	HeapTuple      tuple;
-	bool           found   = false;
-	bool           isnull;
+	int                   i;
+	PeerTxnEntry         *pte;
+	bool                  found   = false;
+	PteLocalXidHashEntry *ret;
 
 	Assert(TransactionIdIsValid(local_xid));
 
@@ -673,49 +534,15 @@ get_origin_by_local_xid(TransactionId local_xid,
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if ((pte[i].origin_node_id != InvalidNodeId) &&
-				(pte[i].local_xid == local_xid))
-			{
-				*origin_node_id = pte[i].origin_node_id;
-				*origin_xid = pte[i].origin_xid;
-				found = true;
-				break;
-			}
+		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
+		                                         HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			*origin_node_id = pte->origin_node_id;
+			*origin_xid = pte->origin_xid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-
-		if (!found) {
-			/* Not found in shmem, now try pg_replication */
-			BEGIN_SYSTAB_ACCESS_BLOCK();
-			{
-				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
-				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-				idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
-				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-				tuple = index_getnext(scan, ForwardScanDirection);
-				if (tuple) {
-					*origin_node_id = fastgetattr(tuple, Anum_pg_replication_reporiginnodeid,
-					                              rep_rel->rd_att, &isnull);
-					*origin_xid = fastgetattr(tuple, Anum_pg_replication_reporiginxid,
-					                          rep_rel->rd_att, &isnull);
-				}
-				index_endscan(scan);
-				pfree(skeys);
-				index_close(idx_rel, NoLock);
-				heap_close(rep_rel, NoLock);
-			}
-			END_SYSTAB_ACCESS_BLOCK();
-		}
 	}
 	END_CRIT_SECTION();
 }
@@ -724,15 +551,10 @@ get_origin_by_local_xid(TransactionId local_xid,
 void
 get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 {
-	int			   i;
-	PeerTxnEntry  *pte;
-	Relation       rep_rel = NULL;
-	Relation       idx_rel = NULL;
-	IndexScanDesc  scan;
-	ScanKey        skeys;
-	HeapTuple      tuple;
-	bool           found   = false;
-	bool           isnull;
+	int                    i;
+	PeerTxnEntry          *pte;
+	bool                   found = false;
+	PteLocalCoidHashEntry *ret;
 
 	*local_xid = InvalidTransactionId;
 
@@ -747,45 +569,14 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if (pte[i].local_coid == coid)
-			{
-				*local_xid = pte[i].local_xid;
-				found = true;
-				break;
-			}
+		ret = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &coid,
+		                                          HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			*local_xid = pte->local_xid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-
-		if (!found) {
-			/* Not found in shmem, now try pg_replication */
-			BEGIN_SYSTAB_ACCESS_BLOCK();
-			{
-				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, coid);
-				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-				idx_rel = index_open(ReplicationCoidIndexId, AccessShareLock);
-				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-				tuple = index_getnext(scan, ForwardScanDirection);
-				if (tuple) {
-					*local_xid = fastgetattr(tuple, Anum_pg_replication_replocalxid,
-					                         rep_rel->rd_att, &isnull);
-				}
-				index_endscan(scan);
-				pfree(skeys);
-				index_close(idx_rel, NoLock);
-				heap_close(rep_rel, NoLock);
-			}
-			END_SYSTAB_ACCESS_BLOCK();
-		}
 	}
 	END_CRIT_SECTION();
 }
@@ -793,16 +584,10 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 CommitOrderId
 get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 {
-	int			   i;
-	PeerTxnEntry  *pte;
-	CommitOrderId  coid    = InvalidCommitOrderId;
-	Relation       rep_rel = NULL;
-	Relation       idx_rel = NULL;
-	IndexScanDesc  scan;
-	ScanKey        skeys;
-	HeapTuple      tuple;
-	bool           found   = false;
-	bool           isnull;
+	int                 i;
+	PeerTxnEntry       *pte;
+	CommitOrderId       coid  = InvalidCommitOrderId;
+	bool                found = false;
 
 	START_CRIT_SECTION();
 	{
@@ -815,47 +600,12 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if ((pte[i].origin_node_id == origin_node_id) &&
-				(pte[i].origin_xid == origin_xid))
-			{
-				coid = pte[i].local_coid;
-				found = true;
-				break;
-			}
+		pte = find_entry_for(origin_node_id, origin_xid);
+		if (pte != NULL) {
+			coid = pte->local_coid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-
-		if (!found) {
-			/* Not found in shmem, now try pg_replication */
-			BEGIN_SYSTAB_ACCESS_BLOCK();
-			{
-				skeys = (ScanKey)palloc0(2 * sizeof(ScanKeyData));
-				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, origin_node_id);
-				ScanKeyInit(&skeys[1], 2, BTEqualStrategyNumber, F_INT4EQ, origin_xid);
-				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-				idx_rel = index_open(ReplicationOriginIndexId, AccessShareLock);
-				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 2, skeys);
-				tuple = index_getnext(scan, ForwardScanDirection);
-				if (tuple) {
-					coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-					                   rep_rel->rd_att, &isnull);
-				}
-				index_endscan(scan);
-				pfree(skeys);
-				index_close(idx_rel, NoLock);
-				heap_close(rep_rel, NoLock);
-			}
-			END_SYSTAB_ACCESS_BLOCK();
-		}
 	}
 	END_CRIT_SECTION();
 
@@ -865,16 +615,11 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 CommitOrderId
 get_local_coid_by_local_xid(TransactionId local_xid)
 {
-	int			   i;
-	PeerTxnEntry  *pte;
-	CommitOrderId  coid    = InvalidCommitOrderId;
-	Relation       rep_rel = NULL;
-	Relation       idx_rel = NULL;
-	IndexScanDesc  scan;
-	ScanKey        skeys;
-	HeapTuple      tuple;
-	bool           found   = false;
-	bool           isnull;
+	int                   i;
+	PeerTxnEntry         *pte;
+	CommitOrderId         coid  = InvalidCommitOrderId;
+	bool                  found = false;
+	PteLocalXidHashEntry *ret;
 
 	START_CRIT_SECTION();
 	{
@@ -887,45 +632,14 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if (pte[i].local_xid == local_xid)
-			{
-				coid = pte[i].local_coid;
-				found = true;
-				break;
-			}
+		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
+		                                         HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			coid = pte->local_coid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-
-		if (!found) {
-			/* Not found in shmem, now try pg_replication */
-			BEGIN_SYSTAB_ACCESS_BLOCK();
-			{
-				skeys = (ScanKey)palloc0(1 * sizeof(ScanKeyData));
-				ScanKeyInit(&skeys[0], 1, BTEqualStrategyNumber, F_INT4EQ, local_xid);
-				rep_rel = heap_open(ReplicationRelationId, AccessShareLock);
-				idx_rel = index_open(ReplicationXidIndexId, AccessShareLock);
-				scan = index_beginscan(rep_rel, idx_rel, SnapshotNow, 1, skeys);
-				tuple = index_getnext(scan, ForwardScanDirection);
-				if (tuple) {
-					coid = fastgetattr(tuple, Anum_pg_replication_replocalcoid,
-					                   rep_rel->rd_att, &isnull);
-				}
-				index_endscan(scan);
-				pfree(skeys);
-				index_close(idx_rel, NoLock);
-				heap_close(rep_rel, NoLock);
-			}
-			END_SYSTAB_ACCESS_BLOCK();
-		}
 	}
 	END_CRIT_SECTION();
 

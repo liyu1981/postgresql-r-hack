@@ -4373,57 +4373,53 @@ void
 bgworker_seq_increment(IMessage *msg)
 {
 	buffer			b;
-
-	/* FIXME: indentation */
-				char	   *seqname;
-				RangeVar   *sequence;
-				Oid			relid;
-				int64       result;
+	char	   *seqname;
+	RangeVar   *sequence;
+	Oid			relid;
+	int64       result;
 
 	IMessageGetReadBuffer(&b, msg);
 
-	/* FIXME: indentation */
+	/* skip the origin node and transaction id, we don't care */
+	b.ptr += sizeof(NodeId) + sizeof(TransactionId);
 
-				/* skip the origin node and transaction id, we don't care */
-				b.ptr += sizeof(NodeId) + sizeof(TransactionId);
+	/*
+	 * FIXME: somehow, we have to make sure to apply multiple
+	 *        SEQ_INCREMENTs in the correct commit order.
+	 */
+	
+	seqname = get_pstring(&b);
+	IMessageRemove(msg);
+	
+	set_ps_display("remote sequence increment", false);
+	
+	MyProc->abortFlag = false;
+	
+	/*
+	 * Because the recreation of the changeset needs a proper
+	 * memory context and a resource owner we start the
+	 * transaction here.
+	 */
+	StartTransactionCommand();
 
-				/*
-				 * FIXME: somehow, we have to make sure to apply multiple
-				 *        SEQ_INCREMENTs in the correct commit order.
-				 */
+	/*
+	 * FIXME: also transmit the schema name.
+	 */
+	sequence = makeRangeVarFromNameList(
+		list_make1(makeString(seqname)));
 
-				seqname = get_pstring(&b);
-				IMessageRemove(msg);
-
-				set_ps_display("remote sequence increment", false);
-
-				MyProc->abortFlag = false;
-
-				/*
-				 * Because the recreation of the changeset needs a proper
-				 * memory context and a resource owner we start the
-				 * transaction here.
-				 */
-				StartTransactionCommand();
-
-				/*
-				 * FIXME: also transmit the schema name.
-				 */
-				sequence = makeRangeVarFromNameList(
-					list_make1(makeString(seqname)));
-
-				relid = RangeVarGetRelid(sequence, false);
-				result = DatumGetInt64(
-					DirectFunctionCall1(nextval_oid,
-										DatumGetObjectId(relid)));
+	relid = RangeVarGetRelid(sequence, false);
+	result = DatumGetInt64(
+		DirectFunctionCall1(nextval_oid,
+		                    DatumGetObjectId(relid)));
 
 #ifdef DEBUG_CSET_APPL
-				elog(DEBUG3, "bg worker [%d/%d]: db %d: processing seq nextval for '%s' (result: %lld)",
-					 MyProcPid, MyBackendId, MyDatabaseId,
-					 seqname, (long long int) result);
+	elog(DEBUG3, "bg worker [%d/%d]: db %d: processing seq nextval for '%s' (result: %lld)",
+	     MyProcPid, MyBackendId, MyDatabaseId,
+	     seqname, (long long int) result);
 #endif
 
-				CommitTransactionCommand();
+	CommitTransactionCommand();
 }
 
 void

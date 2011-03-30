@@ -57,8 +57,12 @@ typedef FormData_pg_replication *Form_pg_replication;
 #define Anum_pg_replication_replocalcoid	4
 
 /* ----------------
- *		initial contents of pg_am
+ *		initial contents of pg_replication
  * ----------------
+ */
+
+/*
+ * function prototypes
  */
 
 #endif   /* PG_AM_H */
