@@ -144,6 +144,7 @@ extern bool		replication_enabled;
 extern bool		replication_may_seed;
 extern char	   *replication_gcs;
 extern char	   *replication_group_name;
+extern int     *replication_peer_txn_entries;
 
 /* local.c - worker backend functions */
 extern void send_txn_aborted_msg(TransactionId xid, int errcode);

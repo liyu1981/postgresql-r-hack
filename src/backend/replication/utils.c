@@ -36,7 +36,10 @@
 #include "utils/fmgroids.h"
 
 /* #define PeerTxnEntries 1024 */
-#define PeerTxnEntries 2
+/* #define PeerTxnEntries 2 */
+#define PeerTxnEntries (replication_peer_txn_entries)
+
+CommitOrderId lowestKnownCommitId = KnownGoodCommitOrderId;
 
 typedef struct PeerTxnEntry
 {
@@ -44,15 +47,18 @@ typedef struct PeerTxnEntry
 	TransactionId	origin_xid;
 	TransactionId	local_xid;
 	CommitOrderId	local_coid;
+
 	bool            valid;
 	bool            commited;
 	bool            aborted;
+
+	TransactionId   dep_coid;
 } PeerTxnEntry;
 
 typedef struct PteOriginHashEntry
 {
-	int8 origin_node_id_xid; /* first 4bytes=node_id, second 4bytes=xid */
-	PeerTxnEntry  *pte;
+	int8          origin_node_id_xid; /* first 4bytes=node_id, second 4bytes=xid */
+	PeerTxnEntry *pte;
 } PteOriginHashEntry;
 
 #define FORM_ORIGIN_NODE_ID_XID(nid, xid) ((int8)((nid))<<sizeof(int4)) | (int8)((xid))
@@ -82,7 +88,7 @@ int           ReplLutCtlShmemSize();
 void          InitSharedPeerTxnQueue();
 void          InitPteHash();
 PeerTxnEntry* alloc_new_entry();
-void          storePteToPgReplication(PeerTxnEntry *pte);
+void          cleanPeerTxnEntries();
 void          insertPteHash(PeerTxnEntry *pte);
 void          deletePteHash(PeerTxnEntry *pte);
 CommitOrderId getLowestKnownCommitOrderId();
@@ -142,12 +148,13 @@ decode_command_type(CsetCmdType cmd)
 }
 
 void
-initPte(PeerTxnEntry *pte)
+InitPte(PeerTxnEntry *pte)
 {
 	pte->origin_node_id = InvalidNodeId;
 	pte->valid = false;
 	pte->commited = false;
 	pte->aborted = false;
+	pte->dep_coid = InvalidCommitOrderId;
 }
 
 int
@@ -197,7 +204,7 @@ InitSharedPeerTxnQueue()
 		pte = (PeerTxnEntry*) &rctl[1];
 
 		for (i = 0; i < PeerTxnEntries; i++) {
-			initPte(&pte[i]);
+			InitPte(&pte[i]);
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -304,7 +311,7 @@ alloc_new_entry()
 	PeerTxnEntry            *pte;
 	volatile ReplLutCtlData *rctl = ReplLutCtl;
 	int                      i;
-	PeerTxnEntry            *ret;
+	PeerTxnEntry            *ret = NULL;
 	bool                     found;
 
 	if (rctl->ptxn_head < PeerTxnEntries) {
@@ -314,29 +321,71 @@ alloc_new_entry()
 		elog(LOG, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
 	}
 	else {
-		/* usual case, here we have to apply some algorithm to evict some slots */
-		/* FIXME: NOT DONE! */
 		pte = (PeerTxnEntry*) &rctl[1];
 		i = rctl->ptxn_tail;
 		found = false;
-		while(i<rctl->ptxn_head) {
+		while (i<rctl->ptxn_head) {
 			if (!pte[i].valid) {
 				ret = &pte[i];
+				if (ret->local_coid == lowestKnownCommitId) {
+					lowestKnownCommitId = KnownGoodCommitOrderId;
+				}
+				InitPte(ret);
+				found = true;
 				break;
 			}
 			i++;
 		}
 
-		if (!found)
-			ret = NULL;
+		/* try to clear some slots and do it again */
+		if (!found) {
+			cleanPeerTxnEntries();
+			pte = (PeerTxnEntry*) &rctl[1];
+			i = rctl->ptxn_tail;
+			while (i<rctl->ptxn_head) {
+				if (!pte[i].valid) {
+					ret = &pte[i];
+					if (ret->local_coid == lowestKnownCommitId) {
+						lowestKnownCommitId = KnownGoodCommitOrderId;
+					}
+					InitPte(ret);
+					break;
+				}
+				i++;
+			}
+		}
 	}
 
 	return ret;
 }
 
 void
-storePteToPgReplication(PeerTxnEntry *pte)
+cleanPeerTxnEntries()
 {
+	PeerTxnEntry            *pte;
+	volatile ReplLutCtlData *rctl = ReplLutCtl;
+	int                      i, j;
+	bool                     found;
+
+	pte = (PeerTxnEntry*) &rctl[1];
+	for (i = rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
+		if (!(pte[i].commited || pte[i].aborted))
+			continue;
+
+		found = false;
+		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
+			if (pte[j].dep_coid == pte[i].local_coid &&
+			    !(pte[j].commited || pte[j].aborted)) {
+				found = true;
+				break;
+			}				
+		}
+		if (found)
+			continue;
+		else {
+			pte[i].valid = false;
+		}
+	}
 }
 
 void
@@ -406,23 +455,28 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
 		while(true) {
-		SpinLockAcquire(&rctl->ptxn_lock);
+			SpinLockAcquire(&rctl->ptxn_lock);
 
-		pte = find_entry_for(origin_node_id, origin_xid);
-		if (!pte)
-		{
-			pte = alloc_new_entry();
-			if (!pte) {
+			pte = find_entry_for(origin_node_id, origin_xid);
+			if (!pte)
+			{
+				pte = alloc_new_entry();
+				if (pte == NULL) {
+					SpinLockRelease(&rctl->ptxn_lock);
+					pg_usleep(1000);
+					continue;
+				}
+				pte->origin_node_id = origin_node_id;
+				pte->origin_xid = origin_xid;
+				pte->local_xid = InvalidTransactionId;
 			}
-			pte->origin_node_id = origin_node_id;
-			pte->origin_xid = origin_xid;
-			pte->local_xid = InvalidTransactionId;
-		}
 
-		pte->local_coid = local_coid;
-		insertPteHash(pte);
-
-		SpinLockRelease(&rctl->ptxn_lock);
+			pte->local_coid = local_coid;
+			pte->dep_coid = getLowestKnownCommitOrderId();
+			insertPteHash(pte);
+			
+			SpinLockRelease(&rctl->ptxn_lock);
+			break;
 		}
 	}
 	END_CRIT_SECTION();
@@ -446,21 +500,30 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
-		SpinLockAcquire(&rctl->ptxn_lock);
+		while(1) {
+			SpinLockAcquire(&rctl->ptxn_lock);
 
-		pte = find_entry_for(origin_node_id, origin_xid);
-		if (!pte)
-		{
-			pte = alloc_new_entry();
-			pte->origin_node_id = origin_node_id;
-			pte->origin_xid = origin_xid;
-			pte->local_coid = InvalidCommitOrderId;
+			pte = find_entry_for(origin_node_id, origin_xid);
+			if (!pte)
+			{
+				pte = alloc_new_entry();
+				if (pte == NULL) {
+					SpinLockRelease(&rctl->ptxn_lock);
+					pg_usleep(1000);
+					continue;
+				}
+				pte->origin_node_id = origin_node_id;
+				pte->origin_xid = origin_xid;
+				pte->local_coid = InvalidCommitOrderId;
+				pte->dep_coid = getLowestKnownCommitOrderId();
+			}
+
+			pte->local_xid = local_xid;
+			insertPteHash(pte);
+			
+			SpinLockRelease(&rctl->ptxn_lock);
+			break;
 		}
-
-		pte->local_xid = local_xid;
-		insertPteHash(pte);
-
-		SpinLockRelease(&rctl->ptxn_lock);
 	}
 	END_CRIT_SECTION();
 }
@@ -485,9 +548,11 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		pte = find_entry_for(origin_node_id, origin_xid);
 		if (pte)
 		{
-			deletePteHash(pte);
-			pte->origin_node_id = InvalidNodeId;
-			pte->valid = false;
+			pte->commited = is_commit;
+			pte->aborted = !is_commit;
+			if (pte->commited && lowestKnownCommitId < pte->local_coid) {
+				lowestKnownCommitId = pte->local_coid;
+			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -684,33 +749,7 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 CommitOrderId
 getLowestKnownCommitOrderId()
 {
-	int            i;
-	PeerTxnEntry  *pte;
-	CommitOrderId  ret = InvalidCommitOrderId;
-
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-		SpinLockAcquire(&rctl->ptxn_lock);
-
-		pte = (PeerTxnEntry*) &rctl[1];
-		for (i=rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
-			if (pte[i].valid) {
-				if (ret == InvalidCommitOrderId) {
-					ret = pte[i].local_coid;
-				}
-				else if (pte[i].local_coid < ret) {
-					ret = pte[i].local_coid;
-				}
-			}
-		}
-
-		SpinLockRelease(&rctl->ptxn_lock);
-	}
-	END_CRIT_SECTION();
-
-	return ret;
+	return lowestKnownCommitId;
 }
 
 /*
