@@ -739,17 +739,6 @@ CoordinatorMain(int argc, char *argv[])
 
 	InitPostgres(NULL, InvalidOid, NULL, NULL);
 
-	/* liyu: Dirty hack!! Now we need to access template1 database,
-	 * just dirty assign the MyDatabaseID variable. */
-	MyDatabaseId = TemplateDbOid;
-	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
-	StartTransactionCommand();
-	GetTransactionSnapshot();
-	SetDatabasePath(GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace));
-	RelationCacheInitializePhase3();
-	CommitTransactionCommand();
-	elog(LOG, "MyDatabaseId=%d", MyDatabaseId);
-
 	SetProcessingMode(NormalProcessing);
 
 	/*
