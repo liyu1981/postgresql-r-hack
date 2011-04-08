@@ -4328,6 +4328,7 @@ bgworker_commit_request(IMessage *msg)
 			 * coordinator, we inform it about the abort immediately.
 			 */
 			bgworker_job_failed(ERRCODE_T_R_SERIALIZATION_FAILURE);
+			erase_transaction(origin_node_id, origin_xid, false);
 			bgworker_reset();
 		}
 	}

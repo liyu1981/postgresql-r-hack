@@ -1554,6 +1554,8 @@ handle_imessage_txn_aborted(gcs_group *group, IMessage *msg)
 	drop_ooo_msgs_for(codb, msg->sender);
 	LWLockRelease(CoordinatorDatabasesLock);
 
+	erase_transaction(origin_node_id, origin_xid, false);
+
 	/*
 	 * Return the TXN_ABORTED message to the backend, so it knows the
 	 * coordinator has handled the abort and it can safely continue.

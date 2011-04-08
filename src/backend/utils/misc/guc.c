@@ -2174,7 +2174,7 @@ static struct config_int ConfigureNamesInt[] =
 		    gettext_noop("Sets the peer trasaction table size."),
 		},
 		&replication_peer_txn_entries,
-		1024, 2, INT_MAX, NULL, NULL
+		1024, 4, INT_MAX, NULL, NULL
 	},
 #endif
 
