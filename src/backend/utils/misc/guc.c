@@ -2168,6 +2168,16 @@ static struct config_int ConfigureNamesInt[] =
 		1024, 100, 102400, NULL, NULL
 	},
 
+#ifdef REPLICATION
+	{
+		{"replication_peer_txn_entries", PGC_SIGHUP, REPLICATION_OPTIONS,
+		    gettext_noop("Sets the peer trasaction table size."),
+		},
+		&replication_peer_txn_entries,
+		1024, 4, INT_MAX, NULL, NULL
+	},
+#endif
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL

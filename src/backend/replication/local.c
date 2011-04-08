@@ -469,15 +469,16 @@ replication_global_commit(void)
 			store_transaction_local_xid(origin_node_id, origin_xid, origin_xid);
 			
 			/* read the commit order id from shared memory */
-			Assert(CommitOrderIdIsValid(
-				       get_local_coid_by_origin(origin_node_id, origin_xid)));
+			Assert(CommitOrderIdIsValid(get_local_coid_by_origin(origin_node_id, origin_xid)));
 
 			WaitUntilCommittable();
-			
+
 			if (MyProc->abortFlag)
 				ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				                errmsg("could not serialize access due to "
 				                       "concurrent update")));
+
+			erase_transaction(origin_node_id, origin_xid, true);
 		}
 		else
 		{

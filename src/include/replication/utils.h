@@ -16,6 +16,8 @@
 #include "nodes/nodes.h"
 #include "storage/proc.h"
 
+#define REPLICATION_PRINT_MEMORY(pointer, size, withchar) 
+/*
 #define REPLICATION_PRINT_MEMORY(pointer, size, withchar)	  \
 	{ \
 	    printf("%%%%% Memory start from %x: \n", (pointer)); \
@@ -31,6 +33,7 @@
 		printf("\n"); \
 	    printf("%%%%% \n"); \
     }
+*/
 
 /* helper function in coordinator.c */
 extern void *std_memory_context_alloc(size_t size);
@@ -52,8 +55,9 @@ typedef struct ReplLutCtlData
 
 	/* lock for editing the message queue */
 	slock_t		ptxn_lock;
-	slock_t		gol_lock;
-	slock_t		lol_lock;
+	slock_t		origin_lock;
+	slock_t		localxid_lock;
+	slock_t     localcoid_lock;
 
 	/*
 	 * The head of the round robin memory, i.e. where new elements are
@@ -66,6 +70,7 @@ typedef struct ReplLutCtlData
 	 */
 	int			ptxn_head;
 	int			ptxn_tail;
+	int         ptxn_laststop;
 } ReplLutCtlData;
 
 extern ReplLutCtlData *ReplLutCtl;
@@ -81,6 +86,10 @@ extern void store_transaction_coid(NodeId origin_node_id,
 extern void store_transaction_local_xid(NodeId origin_node_id,
 										TransactionId origin_xid,
 										TransactionId local_xid);
+
+extern void erase_transaction(NodeId origin_node_id,
+                              TransactionId origin_xid,
+                              bool is_commit);
 
 /* query functions */
 extern void get_multi_coids(CommitOrderId *eff_coid,

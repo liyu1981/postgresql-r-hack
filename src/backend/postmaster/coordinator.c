@@ -73,6 +73,7 @@
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "libpq/pqsignal.h"
@@ -655,10 +656,11 @@ populate_co_databases()
 NON_EXEC_STATIC void
 CoordinatorMain(int argc, char *argv[])
 {
-	sigjmp_buf	local_sigjmp_buf;
-	IMessage   *msg = NULL;
-	bool        can_launch;
-	int         ret;
+	sigjmp_buf     local_sigjmp_buf;
+	IMessage      *msg = NULL;
+	bool           can_launch;
+	int            ret;
+	MemoryContext  oldcxt;
 
 	/* we are a postmaster subprocess now */
 	IsUnderPostmaster = true;
@@ -812,6 +814,7 @@ CoordinatorMain(int argc, char *argv[])
 	PG_SETMASK(&UnBlockSig);
 
 	CoordinatorShmem->co_coordinatorid = MyBackendId;
+	CoordinatorShmem->co_av_started = false;
 
 	/*
 	 * Initial population of the database list from pg_database
@@ -847,7 +850,8 @@ CoordinatorMain(int argc, char *argv[])
 		if (!PostmasterIsAlive(true))
 			proc_exit(1);
 
-		can_launch = (CoordinatorShmem->co_freeWorkers != NULL);
+		can_launch = (CoordinatorShmem->co_freeWorkers != NULL &&
+			CoordinatorShmem->co_av_started != true);
 		coordinator_determine_sleep(can_launch, false, &nap);
 
 		/* Initialize variables for listening on sockets */ 
@@ -2101,6 +2105,7 @@ BackgroundWorkerMain(int argc, char *argv[])
 					LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
 					SHMQueueInsertBefore(&CoordinatorShmem->co_runningWorkers,
 										 &MyWorkerInfo->wi_links);
+					CoordinatorShmem->co_av_started = true;
 					LWLockRelease(WorkerInfoLock);
 
 					/* do an appropriate amount of work */
@@ -2112,6 +2117,7 @@ BackgroundWorkerMain(int argc, char *argv[])
 					 */
 					LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
 					SHMQueueDelete(&MyWorkerInfo->wi_links);
+					CoordinatorShmem->co_av_started = false;
 					LWLockRelease(WorkerInfoLock);
 
 					bgworker_job_completed();

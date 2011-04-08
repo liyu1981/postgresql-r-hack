@@ -21,6 +21,9 @@
 #include "miscadmin.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/hash.h"
+#include "catalog/pg_replication.h"
+#include "catalog/indexing.h"
 #include "storage/imsg.h"
 #include "storage/lwlock.h"
 #include "storage/lmgr.h"
@@ -30,11 +33,66 @@
 #include "replication/replication.h"
 #include "replication/cset.h"
 #include "replication/utils.h"
+#include "utils/fmgroids.h"
 
-static int ReplLutCtlShmemSize(void);
-void InitSharedPeerTxnQueue(int size);
-void InitSharedGOLHash(int size);
-void InitSharedLOLHash(int size);
+/* #define PeerTxnEntries 1024 */
+/* #define PeerTxnEntries 2 */
+#define PeerTxnEntries (replication_peer_txn_entries)
+
+CommitOrderId lowestKnownCommitId = FirstNormalCommitOrderId;
+
+typedef struct PeerTxnEntry
+{
+	NodeId			origin_node_id;
+	TransactionId	origin_xid;
+	TransactionId	local_xid;
+	CommitOrderId	local_coid;
+
+	bool            valid;
+	bool            commited;
+	bool            aborted;
+
+	TransactionId   dep_coid;
+} PeerTxnEntry;
+
+typedef struct PteOriginHashEntry
+{
+	TransactionId origin_node_id;
+	TransactionId origin_xid;
+	PeerTxnEntry *pte;
+} PteOriginHashEntry;
+
+typedef struct PteLocalXidHashEntry
+{
+	TransactionId  local_xid;
+	PeerTxnEntry  *pte;
+} PteLocalXidHashEntry;
+
+typedef struct PteLocalCoidHashEntry
+{
+	TransactionId  local_coid;
+	PeerTxnEntry  *pte;
+} PteLocalCoidHashEntry;
+
+#define PTEHASH_INSERT_ORIGIN 0x01
+#define PTEHASH_INSERT_XID    0x02
+#define PTEHASH_INSERT_COID   0x04
+
+/* globals keeping pointers to the shmem areas */
+ReplLutCtlData *ReplLutCtl;
+HTAB           *PteOriginHash;
+HTAB           *PteLocalXidHash;
+HTAB           *PteLocalCoidHash;
+
+void          InitPte(PeerTxnEntry *pte);
+int           ReplLutCtlShmemSize();
+void          InitSharedPeerTxnQueue();
+void          InitPteHash();
+PeerTxnEntry* alloc_new_entry();
+void          cleanPeerTxnEntries();
+void          insertPteHash(PeerTxnEntry *pte, int optflag);
+void          deletePteHash(PeerTxnEntry *pte);
+CommitOrderId getLowestKnownCommitOrderId();
 
 char *
 decode_database_state(rdb_state state)
@@ -74,38 +132,18 @@ decode_command_type(CsetCmdType cmd)
 	}
 }
 
-
-#define PeerTxnEntries 1000
-#define GOLEntries 1000
-#define LOLEntries 1000
-
-typedef struct PeerTxnEntry
+void
+InitPte(PeerTxnEntry *pte)
 {
-	NodeId			origin_node_id;
-	TransactionId	origin_xid;
-	TransactionId	local_xid;
-	CommitOrderId	local_coid;
-} PeerTxnEntry;
+	pte->origin_node_id = InvalidNodeId;
+	pte->valid = false;
+	pte->commited = false;
+	pte->aborted = false;
+	pte->dep_coid = InvalidCommitOrderId;
+}
 
-typedef struct GlobalOidLookupEntry
-{
-	Oid		loid, goid;
-} GlobalOidLookupEntry;
-
-typedef struct LocalOidLookupEntry
-{
-	Oid		goid, loid;
-} LocalOidLookupEntry;
-
-/* globals keeping pointers to the shmem areas */
-ReplLutCtlData *ReplLutCtl;
-HTAB *SharedPeerTxnHash;
-HTAB *SharedGOLHash;
-HTAB *SharedLOLHash;
-
-
-static int
-ReplLutCtlShmemSize(void)
+int
+ReplLutCtlShmemSize()
 {
 	Size		size;
 
@@ -114,33 +152,25 @@ ReplLutCtlShmemSize(void)
 
 	/* size of peer transaction queue */
 	size = add_size(size, mul_size(PeerTxnEntries,
-		MAXALIGN(sizeof(PeerTxnEntry))));
+	                               MAXALIGN(sizeof(PeerTxnEntry))));
+
+	/* size of PteOriginHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteOriginHashEntry))));
+
+	/* size of PteLocalXidHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteLocalXidHashEntry))));
+
+	/* size of PteLocalCoidHash */
+	size = add_size(size, mul_size(PeerTxnEntries,
+	                               MAXALIGN(sizeof(HASHELEMENT)+sizeof(PteLocalCoidHashEntry))));
 
 	return size;
 }
-
-
-int
-ReplLutShmemSize(void)
-{
-	Size		size = ReplLutCtlShmemSize();
-
-	/* size of local oid -> global oid LUT */
-	size = add_size(size, mul_size(GOLEntries, 
-		MAXALIGN(sizeof(HASHELEMENT)) +
-			MAXALIGN(sizeof(GlobalOidLookupEntry))));
-
-	/* size of control structure */
-	size = add_size(size, mul_size(LOLEntries,
-		MAXALIGN(sizeof(HASHELEMENT)) +
-			MAXALIGN(sizeof(LocalOidLookupEntry))));
-
-	return size;
-}
-
 
 void
-InitSharedPeerTxnQueue(int size)
+InitSharedPeerTxnQueue()
 {
 	int				i;
 	PeerTxnEntry   *pte;
@@ -154,20 +184,21 @@ InitSharedPeerTxnQueue(int size)
 
 		rctl->ptxn_head = 0;
 		rctl->ptxn_tail = 0;
+		rctl->ptxn_laststop = 0;
 
 		pte = (PeerTxnEntry*) &rctl[1];
 
-		for (i = 0; i < PeerTxnEntries; i++)
-			pte[i].origin_node_id = InvalidNodeId;
+		for (i = 0; i < PeerTxnEntries; i++) {
+			InitPte(&pte[i]);
+		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
 	}
 	END_CRIT_SECTION();
 }
 
-
 void
-InitSharedGOLHash(int size)
+InitPteHash()
 {
 	HASHCTL		info;
 
@@ -176,69 +207,56 @@ InitSharedGOLHash(int size)
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
-		SpinLockAcquire(&rctl->gol_lock);
+		SpinLockAcquire(&rctl->origin_lock);
+		info.keysize = sizeof(TransactionId) + sizeof(TransactionId);
+		info.entrysize = sizeof(PteOriginHashEntry);
+		info.hash = tag_hash;
+		PteOriginHash = ShmemInitHash("PteOriginHash",
+		                              PeerTxnEntries, PeerTxnEntries, &info,
+		                              HASH_ELEM | HASH_FUNCTION);
+		if (!PteOriginHash)
+			elog(FATAL, "Could not initialize PteOriginHash hash table");
+		SpinLockRelease(&rctl->origin_lock);
 
-		/* BufferTag maps to Buffer */
-		info.keysize = sizeof(Oid);
-		info.entrysize = sizeof(GlobalOidLookupEntry);
+		SpinLockAcquire(&rctl->localxid_lock);
+		info.keysize = sizeof(TransactionId);
+		info.entrysize = sizeof(PteLocalXidHashEntry);
 		info.hash = oid_hash;
+		PteLocalXidHash = ShmemInitHash("PteLocalxidHash",
+		                                PeerTxnEntries, PeerTxnEntries, &info,
+		                                HASH_ELEM | HASH_FUNCTION);
+		if (!PteLocalXidHash)
+			elog(FATAL, "Could not initialize PteLocalXidHash hash table");
+		SpinLockRelease(&rctl->localxid_lock);
 
-		SharedGOLHash = ShmemInitHash("Shared Global Oid Lookup Table",
-			size, size, &info,
-			HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
-
-		if (!SharedGOLHash)
-			elog(FATAL, "could not initialize shared buffer hash table");
-
-		SpinLockRelease(&rctl->ptxn_lock);
+		SpinLockAcquire(&rctl->localcoid_lock);
+		info.keysize = sizeof(TransactionId);
+		info.entrysize = sizeof(PteLocalCoidHashEntry);
+		info.hash = oid_hash;
+		PteLocalCoidHash = ShmemInitHash("PteLocalcoidHash",
+		                                 PeerTxnEntries, PeerTxnEntries, &info,
+		                                 HASH_ELEM | HASH_FUNCTION);
+		if (!PteLocalCoidHash)
+			elog(FATAL, "Could not initialize PteLocalCoidHash hash table");
+		SpinLockRelease(&rctl->localcoid_lock);
 	}
 	END_CRIT_SECTION();
 }
-
-
-void
-InitSharedLOLHash(int size)
-{
-	HASHCTL		info;
-
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-
-		SpinLockAcquire(&rctl->lol_lock);
-
-		/* BufferTag maps to Buffer */
-		info.keysize = sizeof(Oid);
-		info.entrysize = sizeof(LocalOidLookupEntry);
-		info.hash = oid_hash;
-
-		SharedLOLHash = ShmemInitHash("Shared Local Oid Lookup Table",
-			size, size, &info,
-			HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
-
-		if (!SharedGOLHash)
-			elog(FATAL, "could not initialize shared buffer hash table");
-
-		SpinLockRelease(&rctl->ptxn_lock);
-	}
-	END_CRIT_SECTION();
-}
-
 
 void
 ReplLutShmemInit(void)
 {
-	bool		found;
+	bool	 found;
 
 #ifdef IMSG_DEBUG
 	elog(DEBUG3, "ReplLutShmemInit(): initializing shared memory");
 	elog(DEBUG5, "                    of size %d", ReplLutCtlShmemSize());
 #endif
 
-	ReplLutCtl = (ReplLutCtlData *)
-		ShmemInitStruct("Replication Lookup Ctl",
-						ReplLutCtlShmemSize(), &found);
+	elog(LOG, "PeerTxnEntries = %d", PeerTxnEntries);
+
+	ReplLutCtl = (ReplLutCtlData *)ShmemInitStruct("Replication Lookup Ctl",
+	                                               ReplLutCtlShmemSize(), &found);
 
 	if (found)
 		return;
@@ -247,41 +265,177 @@ ReplLutShmemInit(void)
 
 	/* initialize all the spin locks */
 	SpinLockInit(&ReplLutCtl->ptxn_lock);
-	SpinLockInit(&ReplLutCtl->gol_lock);
-	SpinLockInit(&ReplLutCtl->lol_lock);
+	SpinLockInit(&ReplLutCtl->origin_lock);
+	SpinLockInit(&ReplLutCtl->localxid_lock);
+	SpinLockInit(&ReplLutCtl->localcoid_lock);
 
 	/* initialize all the hash tables */
-	InitSharedPeerTxnQueue(PeerTxnEntries);
-#if 0
-	InitSharedGOLHash(GOLEntries);
-	InitSharedLOLHash(LOLEntries);
-#endif
+	InitSharedPeerTxnQueue();
+	InitPteHash();
 }
 
 static PeerTxnEntry *
 find_entry_for(NodeId origin_node_id, TransactionId origin_xid)
 {
-	volatile ReplLutCtlData    *rctl = ReplLutCtl;
-	PeerTxnEntry			   *pte = (PeerTxnEntry*) &rctl[1];
-	int							i;
+	PeerTxnEntry       *pte = NULL;
+	PteOriginHashEntry  search_key;
+	bool                found;
+	void               *ret;
 
-	/* we don't support wrapping, yet */
-	Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-	for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-	{
-		if (pte[i].origin_node_id == origin_node_id &&
-			pte[i].origin_xid == origin_xid)
-		{
-#ifdef CSET_APPL_DEBUG
-			elog(DEBUG3, "bg worker [%d/%d]: found entry for (%d/%d)",
-				 MyProcPid, MyBackendId, origin_node_id, origin_xid);
-#endif
+	search_key.origin_node_id = origin_node_id;
+	search_key.origin_xid = origin_xid;
+	found = false;
+	ret = hash_search(PteOriginHash, &search_key, HASH_FIND, &found);
+	if (ret != NULL) {
+		pte = ((PteOriginHashEntry*)ret)->pte;
+	}
 
-			return &pte[i];
+	return pte;
+}
+
+PeerTxnEntry *
+alloc_new_entry()
+{
+	PeerTxnEntry            *pte;
+	volatile ReplLutCtlData *rctl = ReplLutCtl;
+	int                      i;
+	PeerTxnEntry            *ret = NULL;
+	bool                     found;
+
+	if (rctl->ptxn_head < PeerTxnEntries) {
+		/* still have not used slot (only happens shortly after init) */
+		pte = (PeerTxnEntry*) &rctl[1];
+		ret = &pte[rctl->ptxn_head++];
+		elog(DEBUG1, "alloc_new_entry, now size=%d", rctl->ptxn_head - rctl->ptxn_tail);
+	}
+	else {
+		pte = (PeerTxnEntry*) &rctl[1];
+		i = rctl->ptxn_tail;
+		found = false;
+		while (i<rctl->ptxn_head) {
+			if (!pte[i].valid) {
+				ret = &pte[i];
+				if (ret->local_coid == lowestKnownCommitId) {
+					lowestKnownCommitId = FirstNormalCommitOrderId;
+				}
+				InitPte(ret);
+				elog(DEBUG1, "alloc_new_entry, reuse no. %d", i);
+				found = true;
+				break;
+			}
+			i++;
+		}
+
+		/* try to clear some slots and do it again */
+		if (!found) {
+			cleanPeerTxnEntries();
+			pte = (PeerTxnEntry*) &rctl[1];
+			i = rctl->ptxn_tail;
+			while (i<rctl->ptxn_head) {
+				if (!pte[i].valid) {
+					ret = &pte[i];
+					if (ret->local_coid == lowestKnownCommitId) {
+						lowestKnownCommitId = FirstNormalCommitOrderId;
+					}
+					InitPte(ret);
+					elog(DEBUG1, "alloc_new_entry, after clean reuse no. %d", i);
+					break;
+				}
+				i++;
+			}
 		}
 	}
 
-	return NULL;
+	if (ret != NULL)
+		ret->valid = true;
+
+	return ret;
+}
+
+void
+cleanPeerTxnEntries()
+{
+	PeerTxnEntry            *pte;
+	volatile ReplLutCtlData *rctl = ReplLutCtl;
+	int                      i, j;
+	bool                     found;
+
+	pte = (PeerTxnEntry*) &rctl[1];
+	for (i = rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
+		if (!(pte[i].commited || pte[i].aborted))
+			continue;
+
+		found = false;
+		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
+			if (pte[j].dep_coid == pte[i].local_coid &&
+			    !(pte[j].commited || pte[j].aborted)) {
+				found = true;
+				break;
+			}				
+		}
+		if (found)
+			continue;
+		else {
+			elog(DEBUG1, "pte reclaimed %d", i);
+			pte[i].valid = false;
+		}
+	}
+}
+
+void
+insertPteHash(PeerTxnEntry *pte, int optflag)
+{
+	PteOriginHashEntry    *rorigin    = NULL;
+	PteLocalXidHashEntry  *rlocalxid  = NULL;
+	PteLocalCoidHashEntry *rlocalcoid = NULL;
+	PteOriginHashEntry     skorigin;
+	PteLocalXidHashEntry   sklocalxid;
+	PteLocalCoidHashEntry  sklocalcoid;
+	bool                   found;
+
+	if (optflag & PTEHASH_INSERT_ORIGIN) {
+		skorigin.origin_node_id = pte->origin_node_id;
+		skorigin.origin_xid = pte->origin_xid;
+		hash_search(PteOriginHash, &skorigin, HASH_REMOVE, &found);
+		rorigin = (PteOriginHashEntry*)hash_search(PteOriginHash, &skorigin,
+		                                           HASH_ENTER, &found);
+		rorigin->pte = pte;
+	}
+
+	if (optflag & PTEHASH_INSERT_XID) {
+		sklocalxid.local_xid = pte->local_xid;
+		hash_search(PteLocalXidHash, &sklocalxid, HASH_REMOVE, &found);
+		rlocalxid = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &sklocalxid,
+		                                               HASH_ENTER, &found);
+		rlocalxid->pte = pte;
+	}
+
+	if (optflag & PTEHASH_INSERT_COID) {
+		sklocalcoid.local_coid = pte->local_coid;
+		hash_search(PteLocalCoidHash, &sklocalcoid, HASH_REMOVE, &found);
+		rlocalcoid = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &sklocalcoid,
+		                                                 HASH_ENTER, &found);
+		rlocalcoid->pte = pte;
+	}
+}
+
+void
+deletePteHash(PeerTxnEntry *pte)
+{
+	PteOriginHashEntry    skorigin;
+	PteLocalXidHashEntry  sklocalxid;
+	PteLocalCoidHashEntry sklocalcoid;
+	bool                  found;
+
+	skorigin.origin_node_id = pte->origin_node_id;
+	skorigin.origin_xid = pte->origin_xid;
+	hash_search(PteOriginHash, &skorigin, HASH_REMOVE, &found);
+
+	sklocalxid.local_xid = pte->local_xid;
+	hash_search(PteLocalXidHash, &sklocalxid, HASH_REMOVE, &found);
+
+	sklocalcoid.local_coid = pte->local_coid;
+	hash_search(PteLocalCoidHash, &sklocalcoid, HASH_REMOVE, &found);
 }
 
 void
@@ -289,6 +443,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 					   CommitOrderId local_coid)
 {
 	PeerTxnEntry   *pte;
+	bool            newflag = false;
 
 	Assert(CommitOrderIdIsValid(local_coid));
 
@@ -302,21 +457,36 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
-		SpinLockAcquire(&rctl->ptxn_lock);
+		while(true) {
+			SpinLockAcquire(&rctl->ptxn_lock);
 
-		pte = find_entry_for(origin_node_id, origin_xid);
-		if (!pte)
-		{
-			pte = (PeerTxnEntry*) &rctl[1];
-			pte = &pte[rctl->ptxn_head++];
-			pte->origin_node_id = origin_node_id;
-			pte->origin_xid = origin_xid;
-			pte->local_xid = InvalidTransactionId;
+			pte = find_entry_for(origin_node_id, origin_xid);
+			if (!pte)
+			{
+				pte = alloc_new_entry();
+				if (pte == NULL) {
+					SpinLockRelease(&rctl->ptxn_lock);
+					pg_usleep(1000);
+					continue;
+				}
+				pte->origin_node_id = origin_node_id;
+				pte->origin_xid = origin_xid;
+				pte->local_xid = InvalidTransactionId;
+				newflag = true;
+			}
+
+			pte->local_coid = local_coid;
+			pte->dep_coid = getLowestKnownCommitOrderId();
+			if (newflag) {
+				insertPteHash(pte, PTEHASH_INSERT_ORIGIN | PTEHASH_INSERT_COID);
+			}
+			else {
+				insertPteHash(pte, PTEHASH_INSERT_COID);
+			}
+			
+			SpinLockRelease(&rctl->ptxn_lock);
+			break;
 		}
-
-		pte->local_coid = local_coid;
-
-		SpinLockRelease(&rctl->ptxn_lock);
 	}
 	END_CRIT_SECTION();
 }
@@ -326,6 +496,7 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 							TransactionId local_xid)
 {
 	PeerTxnEntry   *pte;
+	bool            newflag = false;
 
 	Assert(TransactionIdIsValid(local_xid));
 
@@ -339,21 +510,69 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 		/* use volatile pointer to prevent code rearrangement */
 		volatile ReplLutCtlData *rctl = ReplLutCtl;
 
+		while(1) {
+			SpinLockAcquire(&rctl->ptxn_lock);
+
+			pte = find_entry_for(origin_node_id, origin_xid);
+			if (!pte)
+			{
+				pte = alloc_new_entry();
+				if (pte == NULL) {
+					SpinLockRelease(&rctl->ptxn_lock);
+					pg_usleep(1000);
+					continue;
+				}
+				pte->origin_node_id = origin_node_id;
+				pte->origin_xid = origin_xid;
+				pte->local_coid = InvalidCommitOrderId;
+				pte->dep_coid = getLowestKnownCommitOrderId();
+				newflag = true;
+			}
+
+			pte->local_xid = local_xid;
+			if (newflag) {
+				insertPteHash(pte, PTEHASH_INSERT_ORIGIN | PTEHASH_INSERT_XID);
+			}
+			else {
+				insertPteHash(pte, PTEHASH_INSERT_XID);
+			}
+			
+			SpinLockRelease(&rctl->ptxn_lock);
+			break;
+		}
+	}
+	END_CRIT_SECTION();
+}
+
+void
+erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commit)
+{
+	PeerTxnEntry   *pte;
+
+#ifdef COORDINATOR_DEBUG
+	elog(DEBUG5, "Coordinator: erasing origin node %d xid %d",
+		 origin_node_id, origin_xid);
+#endif
+
+	START_CRIT_SECTION();
+	{
+		/* use volatile pointer to prevent code rearrangement */
+		volatile ReplLutCtlData *rctl = ReplLutCtl;
+
 		SpinLockAcquire(&rctl->ptxn_lock);
 
 		pte = find_entry_for(origin_node_id, origin_xid);
-		if (!pte)
+		if (pte)
 		{
-			pte = (PeerTxnEntry*) &rctl[1];
-			pte = &pte[rctl->ptxn_head++];
-			pte->origin_node_id = origin_node_id;
-			pte->origin_xid = origin_xid;
-			pte->local_coid = InvalidCommitOrderId;
+			pte->commited = is_commit;
+			pte->aborted = !is_commit;
+			if (pte->commited && lowestKnownCommitId < pte->local_coid) {
+				lowestKnownCommitId = pte->local_coid;
+			}
 		}
 
-		pte->local_xid = local_xid;
-
 		SpinLockRelease(&rctl->ptxn_lock);
+		elog(DEBUG1, "erase_transaction, is_commit=%d", is_commit);
 	}
 	END_CRIT_SECTION();
 }
@@ -362,8 +581,10 @@ void
 get_origin_by_local_xid(TransactionId local_xid,
 						NodeId *origin_node_id, TransactionId *origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
+	int                   i;
+	PeerTxnEntry         *pte;
+	bool                  found   = false;
+	PteLocalXidHashEntry *ret;
 
 	Assert(TransactionIdIsValid(local_xid));
 
@@ -394,21 +615,12 @@ get_origin_by_local_xid(TransactionId local_xid,
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if ((pte[i].origin_node_id != InvalidNodeId) &&
-				(pte[i].local_xid == local_xid))
-			{
-				*origin_node_id = pte[i].origin_node_id;
-				*origin_xid = pte[i].origin_xid;
-				break;
-			}
+		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
+		                                         HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			*origin_node_id = pte->origin_node_id;
+			*origin_xid = pte->origin_xid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -420,8 +632,10 @@ get_origin_by_local_xid(TransactionId local_xid,
 void
 get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
+	int                    i;
+	PeerTxnEntry          *pte;
+	bool                   found = false;
+	PteLocalCoidHashEntry *ret;
 
 	*local_xid = InvalidTransactionId;
 
@@ -436,19 +650,11 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if (pte[i].local_coid == coid)
-			{
-				*local_xid = pte[i].local_xid;
-				break;
-			}
+		ret = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &coid,
+		                                          HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			*local_xid = pte->local_xid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -459,9 +665,10 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 CommitOrderId
 get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-	CommitOrderId   coid = InvalidCommitOrderId;
+	int                 i;
+	PeerTxnEntry       *pte;
+	CommitOrderId       coid  = InvalidCommitOrderId;
+	bool                found = false;
 
 	START_CRIT_SECTION();
 	{
@@ -474,20 +681,9 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if ((pte[i].origin_node_id == origin_node_id) &&
-				(pte[i].origin_xid == origin_xid))
-			{
-				coid = pte[i].local_coid;
-				break;
-			}
+		pte = find_entry_for(origin_node_id, origin_xid);
+		if (pte != NULL) {
+			coid = pte->local_coid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -500,9 +696,11 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 CommitOrderId
 get_local_coid_by_local_xid(TransactionId local_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-	CommitOrderId   coid = InvalidCommitOrderId;
+	int                   i;
+	PeerTxnEntry         *pte;
+	CommitOrderId         coid  = InvalidCommitOrderId;
+	bool                  found = false;
+	PteLocalXidHashEntry *ret;
 
 	START_CRIT_SECTION();
 	{
@@ -515,19 +713,11 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-
-			if (pte[i].local_xid == local_xid)
-			{
-				coid = pte[i].local_coid;
-				break;
-			}
+		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
+		                                         HASH_FIND, &found);
+		if (ret != NULL) {
+			pte = ret->pte;
+			coid = pte->local_coid;
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
@@ -542,60 +732,40 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 				TransactionId local_xid,
 				NodeId origin_node_id, TransactionId origin_xid)
 {
-	int				i;
-	PeerTxnEntry   *pte;
-
-	bool			found_eff_coid = false,
-					found_req_coid = false;
+	bool		  found_eff_coid = false,
+		          found_req_coid = false;
+	CommitOrderId r1, r2;
 
 	*eff_coid = KnownGoodCommitOrderId;
 	*req_coid = KnownGoodCommitOrderId;
 
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-
-		SpinLockAcquire(&rctl->ptxn_lock);
-
-		pte = (PeerTxnEntry*) &rctl[1];
-
-		/* we don't support wrapping, yet */
-		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		for (i = rctl->ptxn_tail; i < rctl->ptxn_head; i++)
-		{
-#if 0
-			elog(DEBUG5, "    node %d xid %d -> local coid %d xid %d",
-				 pte[i].origin_node_id, pte[i].origin_xid,
-				 pte[i].local_coid, pte[i].local_xid);
-#endif
-				 
-			if ((pte[i].origin_node_id != InvalidNodeId) &&
-				(pte[i].local_xid == local_xid))
-			{
-				*eff_coid = pte[i].local_coid;
-				if (found_req_coid)
-					break;
-				found_eff_coid = true;
-			}
-
-			if ((pte[i].origin_node_id == origin_node_id) &&
-				(pte[i].origin_xid == origin_xid))
-			{
-				*req_coid = pte[i].local_coid;
-				if (found_eff_coid)
-					break;
-				found_req_coid = true;
-			}
-		}
-
-		SpinLockRelease(&rctl->ptxn_lock);
+	r1 = get_local_coid_by_local_xid(local_xid);
+	if (r1 == InvalidCommitOrderId) {
+		found_eff_coid = false;
 	}
-	END_CRIT_SECTION();
+	else {
+		found_eff_coid = true;
+		*eff_coid = r1;
+	}
+
+	r2 = get_local_coid_by_origin(origin_node_id, origin_xid);
+	if (r2 == InvalidCommitOrderId) {
+		found_req_coid = false;
+	}
+	else {
+		found_req_coid = true;
+		*req_coid = r2;
+	}
 
 	if (found_eff_coid && !found_req_coid) {
 		*req_coid = *eff_coid;
 	}
+}
+
+CommitOrderId
+getLowestKnownCommitOrderId()
+{
+	return lowestKnownCommitId;
 }
 
 /*
@@ -609,10 +779,10 @@ get_multi_coids(CommitOrderId *eff_coid, CommitOrderId *req_coid,
 void
 WaitUntilCommittable(void)
 {
-	TransactionId   xid;
-	CommitOrderId   my_coid = InvalidCommitOrderId,
-		            dep_coid;
-	PeerTxnEntry   *pte;
+	TransactionId  xid;
+	CommitOrderId  my_coid = InvalidCommitOrderId,
+		           dep_coid;
+	PeerTxnEntry  *pte;
 
 	/*
 	 * Short circuit for aborted transactions.
@@ -627,18 +797,7 @@ WaitUntilCommittable(void)
 	/*
 	 * Lookup the lowest known commit order id
 	 */
-	START_CRIT_SECTION();
-	{
-		/* use volatile pointer to prevent code rearrangement */
-		volatile ReplLutCtlData *rctl = ReplLutCtl;
-		SpinLockAcquire(&rctl->ptxn_lock);
-
-		pte = (PeerTxnEntry*) &rctl[1];
-		dep_coid = pte[rctl->ptxn_tail].local_coid;
-
-		SpinLockRelease(&rctl->ptxn_lock);
-	}
-	END_CRIT_SECTION();
+	dep_coid = getLowestKnownCommitOrderId();
 
 	/*
 	 * Loop over all transactions with commit order ids in between the

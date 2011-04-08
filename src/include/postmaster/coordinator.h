@@ -107,6 +107,7 @@ typedef struct
 	WorkerInfo	co_freeWorkers;
 	SHM_QUEUE	co_runningWorkers;
 	WorkerInfo	co_startingWorker;
+	bool        co_av_started;
 } CoordinatorShmemStruct;
 
 extern CoordinatorShmemStruct *CoordinatorShmem;
