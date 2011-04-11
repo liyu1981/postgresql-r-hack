@@ -141,5 +141,7 @@ bool				replication_may_seed = false;
 char			   *replication_gcs = "spread";
 char			   *replication_group_name = "postgres";
 int                 replication_peer_txn_entries = 1024;
+int                 replication_co_txn_info_max = 1024;
+int                 replication_imsg_shmem_dyn_buffer_size = 2097152;
 
 #endif	/* REPLICATION */

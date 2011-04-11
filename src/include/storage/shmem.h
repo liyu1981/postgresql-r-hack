@@ -77,7 +77,11 @@ extern void wam_check(void *ptr);
 /* shmem.c */
 
 /* TODO: replace with GUC variable to be configurable */
-#define ShmemDynBufferSize 2097152		/* 2 MiB */
+/* #define ShmemDynBufferSize 2097152		/\* 2 MiB *\/ */
+
+extern int replication_imsg_shmem_dyn_buffer_size;
+
+#define ShmemDynBufferSize replication_imsg_shmem_dyn_buffer_size
 
 extern void InitShmemAccess(void *seghdr);
 extern void InitShmemAllocation(void);

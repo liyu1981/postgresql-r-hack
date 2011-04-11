@@ -517,6 +517,7 @@ get_co_transaction_info(NodeId origin_node_id, TransactionId origin_xid)
 
 	if (!found)
 	{
+		elog(LOG, "xi created in co_txn_info [total %d]", hash_get_num_entries(co_txn_info));
 		xi->local_backend_id = InvalidBackendId;
 		xi->local_xid = InvalidTransactionId;
 		xi->local_coid = InvalidCommitOrderId;
@@ -1013,6 +1014,7 @@ coordinator_replication_init(void)
 	/* init the data to be NULL, since we need it in spread_init */
 	gcsi->data = NULL;
 
+	elog(LOG, "replication_co_txn_info_max = %d", replication_co_txn_info_max);
 
 	/* initialize the coordinator's private transaction info hash */
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
@@ -1020,7 +1022,8 @@ coordinator_replication_init(void)
 	hash_ctl.entrysize = sizeof(CoTransactionInfo);
 	hash_ctl.hash = tag_hash;
 	co_txn_info = hash_create("Coordinator: txn info",
-							  100, &hash_ctl, HASH_ELEM | HASH_FUNCTION);
+							  replication_co_txn_info_max,
+	                          &hash_ctl, HASH_ELEM | HASH_FUNCTION);
 
 	set_ps_display("disconnected", false);
 

@@ -2176,6 +2176,22 @@ static struct config_int ConfigureNamesInt[] =
 		&replication_peer_txn_entries,
 		1024, 4, INT_MAX, NULL, NULL
 	},
+
+	{
+		{"replication_co_txn_info_max", PGC_SIGHUP, REPLICATION_OPTIONS,
+		    gettext_noop("Sets the max size of co_txn_info."),
+		},
+		&replication_co_txn_info_max,
+		1024, 4, INT_MAX, NULL, NULL
+	},
+
+	{
+		{"replication_imsg_shmem_dyn_buffer_size", PGC_SIGHUP, REPLICATION_OPTIONS,
+		    gettext_noop("Sets the size of shmem dyn buffer for imsg."),
+		},
+		&replication_imsg_shmem_dyn_buffer_size,
+		2097152, 2097152, INT_MAX, NULL, NULL
+	},
 #endif
 
 	/* End-of-list marker */

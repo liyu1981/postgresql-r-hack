@@ -41,6 +41,30 @@ IMessageCtlData *IMessageCtl = NULL;
  */
 static bool got_IMessage = false;
 
+void printIMessageCtlInfo();
+
+
+void
+printIMessageCtlInfo()
+{
+	int i, c;
+	Deque *q;
+	DequeElem *p;
+
+	for (i=0; i<MaxBackends; ++i) {
+		q = &IMessageCtl->lists[i];
+		c = 0;
+		p = q->head.next;
+		while (p != &(q->head)) {
+			c += 1;
+			p = p->next;
+		}
+
+		if (c > 0) {
+			elog(LOG, "IMessage queue for backend %d not empty (%d children)", i, c);
+		}
+	}
+}
 
 /*
  * Initialization of shared memory for internal messages.
@@ -195,6 +219,8 @@ IMessageCreate(IMessageType type, int msg_size)
 
 		pg_usleep(100000);
 	}
+
+	printIMessageCtlInfo();
 
 	return msg;
 }
