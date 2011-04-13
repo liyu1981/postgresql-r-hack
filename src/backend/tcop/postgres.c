@@ -59,6 +59,7 @@
 #include "postmaster/coordinator.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
+#include "replication/replication.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -3863,6 +3864,7 @@ PostgresMain(int argc, char *argv[], const char *username)
 				elog(ERROR, "Cannot connect, invalid database state");
 		}
 	}
+
 #endif
 
 

@@ -291,6 +291,7 @@ spread_connect(gcs_info *gcsi)
 		    elog(LOG, "GC Layer: connection established to spread daemon %s with private name %s.",
 		         GC_DATA(gcsi)->spread_name,
 		         GC_DATA(gcsi)->private_group_name);
+		    set_ps_display("connected", false);
 		    gcsi_gcs_ready(gcsi);
 
 		    /* connected, so start the recv thread */

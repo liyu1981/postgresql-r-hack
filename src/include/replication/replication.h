@@ -145,6 +145,7 @@ extern bool		replication_may_seed;
 extern char	   *replication_gcs;
 extern char	   *replication_group_name;
 extern int      replication_peer_txn_entries;
+extern int      replication_co_txn_info_max;
 
 /* local.c - worker backend functions */
 extern void send_txn_aborted_msg(TransactionId xid, int errcode);
@@ -175,5 +176,10 @@ extern void bgworker_recovery_restart(IMessage *msg);
 extern void bgworker_schema_adaption(IMessage *msg);
 extern void bgworker_recovery_data(IMessage *msg);
 extern void bgworker_recovery_request(IMessage *msg);
+
+/* coordinator.c */
+extern HTAB *co_txn_info;
+void init_co_txn_info_table();
+void erase_co_txn_info(NodeId original_node_id, TransactionId origin_xid);
 
 #endif   /* REPLICATION_H */
