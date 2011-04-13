@@ -376,8 +376,12 @@ cleanPeerTxnEntries()
 		if (found)
 			continue;
 		else {
-			elog(DEBUG1, "pte reclaimed %d", i);
+			elog(DEBUG1, "pte reclaimed %d [%d, %d, %d, %d]", i,
+			     pte[i].origin_node_id, pte[i].origin_xid,
+			     pte[i].local_xid, pte[i].local_coid);
 			pte[i].valid = false;
+			/* delete the entry in co_txn_info also */
+			erase_co_txn_info(pte[i].origin_node_id, pte[i].origin_xid);
 		}
 	}
 }

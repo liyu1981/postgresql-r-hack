@@ -177,4 +177,9 @@ extern void bgworker_schema_adaption(IMessage *msg);
 extern void bgworker_recovery_data(IMessage *msg);
 extern void bgworker_recovery_request(IMessage *msg);
 
+/* coordinator.c */
+extern HTAB *co_txn_info;
+void init_co_txn_info_table();
+void erase_co_txn_info(NodeId original_node_id, TransactionId origin_xid);
+
 #endif   /* REPLICATION_H */

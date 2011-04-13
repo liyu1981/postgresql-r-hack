@@ -217,10 +217,12 @@ IMessageCreate(IMessageType type, int msg_size)
 		elog(WARNING, "imessage: waiting for %d bytes to be freed",
 			 (int) sizeof(IMessage) + msg_size);
 
+		printIMessageCtlInfo();
+
+		/* elog(PANIC, "we should stop here!"); */
+
 		pg_usleep(100000);
 	}
-
-	printIMessageCtlInfo();
 
 	return msg;
 }

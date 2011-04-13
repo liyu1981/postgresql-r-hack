@@ -47,7 +47,7 @@
 /* global variables */
 static gcs_info *gcsi = NULL;			/* the active gcs connection */
 static bool seed_mode = false;
-static HTAB *co_txn_info = NULL;
+HTAB *co_txn_info = NULL;
 
 typedef struct CoTransactionInfo
 {
@@ -511,13 +511,17 @@ get_co_transaction_info(NodeId origin_node_id, TransactionId origin_xid)
 	CoTransactionInfo *xi;
 	bool found;
 
+	/* while (hash_get_num_entries(co_txn_info) + 1 >= replication_co_txn_info_max) { */
+	/* 	pg_usleep(100); /\* dirty waiting 100ms *\/ */
+	/* } */
+
 	key.origin_node_id = origin_node_id;
 	key.origin_xid = origin_xid;
 	xi = hash_search(co_txn_info, &key, HASH_ENTER, &found);
 
 	if (!found)
 	{
-		elog(LOG, "xi created in co_txn_info [total %d]", hash_get_num_entries(co_txn_info));
+		elog(DEBUG1, "xi created in co_txn_info [total %d]", hash_get_num_entries(co_txn_info));
 		xi->local_backend_id = InvalidBackendId;
 		xi->local_xid = InvalidTransactionId;
 		xi->local_coid = InvalidCommitOrderId;
@@ -992,6 +996,33 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 #endif
 }
 
+void
+erase_co_txn_info(NodeId origin_node_id, TransactionId origin_xid)
+{
+	CoTransactionInfo key;
+	bool              found;
+
+	key.origin_node_id = origin_node_id;
+	key.origin_xid = origin_xid;
+	hash_search(co_txn_info, &key, HASH_REMOVE, &found);
+	elog(DEBUG1, "co_txn %d/%d removed.", origin_node_id, origin_xid);
+}
+
+void
+init_co_txn_info_table()
+{
+	HASHCTL hash_ctl;
+
+	elog(LOG, "replication_co_txn_info_max = %d", replication_co_txn_info_max);
+	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(NodeId) + sizeof(TransactionId);
+	hash_ctl.entrysize = sizeof(CoTransactionInfo);
+	hash_ctl.hash = tag_hash;
+	co_txn_info = ShmemInitHash("Coordinator: txn info",
+	                            2*replication_co_txn_info_max, 2*replication_co_txn_info_max,
+	                            &hash_ctl, HASH_ELEM | HASH_FUNCTION);
+}
+
 /*
  *	coordinator_replication_init
  */
@@ -1014,16 +1045,19 @@ coordinator_replication_init(void)
 	/* init the data to be NULL, since we need it in spread_init */
 	gcsi->data = NULL;
 
-	elog(LOG, "replication_co_txn_info_max = %d", replication_co_txn_info_max);
+	/* elog(LOG, "replication_co_txn_info_max = %d", replication_co_txn_info_max); */
 
-	/* initialize the coordinator's private transaction info hash */
-	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(NodeId) + sizeof(TransactionId);
-	hash_ctl.entrysize = sizeof(CoTransactionInfo);
-	hash_ctl.hash = tag_hash;
-	co_txn_info = hash_create("Coordinator: txn info",
-							  replication_co_txn_info_max,
-	                          &hash_ctl, HASH_ELEM | HASH_FUNCTION);
+	/* /\* initialize the coordinator's private transaction info hash *\/ */
+	/* MemSet(&hash_ctl, 0, sizeof(hash_ctl)); */
+	/* hash_ctl.keysize = sizeof(NodeId) + sizeof(TransactionId); */
+	/* hash_ctl.entrysize = sizeof(CoTransactionInfo); */
+	/* hash_ctl.hash = tag_hash; */
+	/* /\* co_txn_info = hash_create("Coordinator: txn info", *\/ */
+	/* /\*                           replication_co_txn_info_max, *\/ */
+	/* /\*                           &hash_ctl, HASH_ELEM | HASH_FUNCTION | HASH_SHARED_MEM); *\/ */
+	/* co_txn_info = ShmemInitHash("Coordinator: txn info", */
+	/*                             2*replication_co_txn_info_max, 2*replication_co_txn_info_max, */
+	/*                             &hash_ctl, HASH_ELEM | HASH_FUNCTION); */
 
 	set_ps_display("disconnected", false);
 

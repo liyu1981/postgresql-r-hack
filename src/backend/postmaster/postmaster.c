@@ -120,6 +120,7 @@
 #include "utils/datetime.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "replication/replication.h"
 
 #ifdef EXEC_BACKEND
 #include "storage/spin.h"
@@ -1361,6 +1362,8 @@ ServerLoop(void)
 		replication_enabled = false;
 		elog(LOG, "Replication is disable by env variable PGR_REPLICATION_OFF=yes");
 	}
+
+	init_co_txn_info_table();
 
 	last_touch_time = time(NULL);
 
