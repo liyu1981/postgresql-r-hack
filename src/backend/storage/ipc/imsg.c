@@ -50,6 +50,7 @@ printIMessageCtlInfo()
 	int i, c;
 	Deque *q;
 	DequeElem *p;
+	IMessage *m;
 
 	for (i=0; i<MaxBackends; ++i) {
 		q = &IMessageCtl->lists[i];
@@ -62,6 +63,17 @@ printIMessageCtlInfo()
 
 		if (c > 0) {
 			elog(LOG, "IMessage queue for backend %d not empty (%d children)", i, c);
+			elog(LOG, "==> Begin dumping IMessage queue %d", i);
+			q = &IMessageCtl->lists[i];
+			c = 0;
+			p = q->head.next;
+			while (p != &(q->head)) {
+				c += 1;
+				m = (IMessage*)p;
+				elog(LOG, "  imessage from %d type %c", m->sender, m->type);
+				p = p->next;
+			}
+			elog(LOG, "==> End dumping IMessage queue %d", i);
 		}
 	}
 }

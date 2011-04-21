@@ -369,15 +369,27 @@ cleanPeerTxnEntries()
 		if (!(pte[i].commited || pte[i].aborted))
 			continue;
 
+		elog(LOG, "start to valid pte %d [%d, %d, %d, %d] depends one %d < %d", i,
+		     pte[i].origin_node_id, pte[i].origin_xid,
+		     pte[i].local_xid, pte[i].local_coid);
+
 		found = false;
 		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
 			if (pte[j].dep_coid <= pte[i].local_coid) {
+				/*elog(LOG, "found small pte %d [%d, %d, %d, %d] depends one %d < %d", i,
+				     pte[j].origin_node_id, pte[j].origin_xid,
+				     pte[j].local_xid, pte[j].local_coid, pte[j].dep_coid, pte[i].local_coid);*/
 				found = true;
 				if (pte[j].commited || pte[j].aborted)
 					found =false;
 				if (found)
 					break;
 			}				
+		}
+		if (pte[i].local_coid == getLowestKnownCommitOrderId())
+		{
+			// we can not clean this one, since some concurrent txn may start to rely on it
+			found = true;
 		}
 		if (found)
 			continue;
@@ -598,7 +610,7 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-		elog(DEBUG1, "erase_transaction, is_commit=%d", is_commit);
+		elog(LOG, "erase_transaction, is_commit=%d (%d)", is_commit, lowestKnownCommitId);
 	}
 	END_CRIT_SECTION();
 }
@@ -664,6 +676,12 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 	PteLocalCoidHashEntry *ret;
 
 	*local_xid = InvalidTransactionId;
+
+	if (coid < getLowestKnownCommitOrderId())
+	{
+		*local_xid = -1; /* means no need to wait */
+		return;
+	}
 
 	START_CRIT_SECTION();
 	{
@@ -851,7 +869,8 @@ WaitUntilCommittable(void)
 		 * Wait until the transaction id is locally known.
 		 */
 		get_local_xid_by_coid(dep_coid, &xid);
-		while (!TransactionIdIsValid(xid))
+		elog(LOG, "start to check valid for %d/%d", dep_coid, xid);
+		while (xid >0 && !TransactionIdIsValid(xid))
 		{
 			if (MyProc->abortFlag)
 				goto abort_waiting;
@@ -861,6 +880,10 @@ WaitUntilCommittable(void)
 			pg_usleep(30000L);
 
 			get_local_xid_by_coid(dep_coid, &xid);
+		}
+
+		if (xid <= 0) {
+			goto next_higher_dep;
 		}
 
 		if (xid == MyProc->xid) {
@@ -899,6 +922,7 @@ WaitUntilCommittable(void)
 		}
 
 		/* increment to process the next higher coid */
+	next_higher_dep:
 		dep_coid++;
 	}
 

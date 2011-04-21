@@ -61,6 +61,11 @@ cset_parse_header(buffer *b)
 	 */
 	if (cset_no == 0)
 	{
+		TransactionId tmp_xid = GetCurrentTransactionIdIfAny();
+		if (tmp_xid != 0)
+		{
+			elog(PANIC, "cset=0, but already a local_xid=%d!!", tmp_xid);
+		}
 		local_xid = GetCurrentTransactionId();
 		store_transaction_local_xid(origin_node_id, origin_xid, local_xid);
 	}
