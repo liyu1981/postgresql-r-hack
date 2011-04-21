@@ -136,6 +136,10 @@ void
 InitPte(PeerTxnEntry *pte)
 {
 	pte->origin_node_id = InvalidNodeId;
+	pte->origin_xid = 0;
+	pte->local_coid = InvalidCommitOrderId;
+	pte->local_xid = 0;
+
 	pte->valid = false;
 	pte->commited = false;
 	pte->aborted = false;
@@ -367,16 +371,18 @@ cleanPeerTxnEntries()
 
 		found = false;
 		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
-			if (pte[j].dep_coid == pte[i].local_coid &&
-			    !(pte[j].commited || pte[j].aborted)) {
+			if (pte[j].dep_coid <= pte[i].local_coid) {
 				found = true;
-				break;
+				if (pte[j].commited || pte[j].aborted)
+					found =false;
+				if (found)
+					break;
 			}				
 		}
 		if (found)
 			continue;
 		else {
-			elog(DEBUG1, "pte reclaimed %d [%d, %d, %d, %d]", i,
+			elog(LOG, "pte reclaimed %d [%d, %d, %d, %d]", i,
 			     pte[i].origin_node_id, pte[i].origin_xid,
 			     pte[i].local_xid, pte[i].local_coid);
 			pte[i].valid = false;
@@ -465,22 +471,30 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 			SpinLockAcquire(&rctl->ptxn_lock);
 
 			pte = find_entry_for(origin_node_id, origin_xid);
+
+			if (pte && pte->local_coid != InvalidCommitOrderId) {
+				elog(LOG, "Pte (%d/%d) with txn %d already have a coid %d associated.",
+				     pte->origin_node_id, pte->origin_xid, pte->local_xid, pte->local_coid);
+				elog(PANIC, "Must die.");
+			}
+
 			if (!pte)
 			{
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
 					pg_usleep(1000);
+					elog(LOG, "Out of space for pte coid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
 				pte->origin_xid = origin_xid;
 				pte->local_xid = InvalidTransactionId;
+				pte->dep_coid = getLowestKnownCommitOrderId();
 				newflag = true;
 			}
 
 			pte->local_coid = local_coid;
-			pte->dep_coid = getLowestKnownCommitOrderId();
 			if (newflag) {
 				insertPteHash(pte, PTEHASH_INSERT_ORIGIN | PTEHASH_INSERT_COID);
 			}
@@ -518,12 +532,20 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 			SpinLockAcquire(&rctl->ptxn_lock);
 
 			pte = find_entry_for(origin_node_id, origin_xid);
+
+			if (pte && pte->local_xid > 0) {
+				elog(LOG, "Pte (%d/%d) with coid %d already have a txn %d associated.",
+				     pte->origin_node_id, pte->origin_xid, pte->local_coid, pte->local_xid);
+				elog(PANIC, "Must die.");
+			}
+			
 			if (!pte)
 			{
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
 					pg_usleep(1000);
+					elog(LOG, "Out of space for pte xid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
@@ -621,7 +643,7 @@ get_origin_by_local_xid(TransactionId local_xid,
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL && ret->pte->valid) {
 			pte = ret->pte;
 			*origin_node_id = pte->origin_node_id;
 			*origin_xid = pte->origin_xid;
@@ -656,7 +678,7 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &coid,
 		                                          HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL & ret->pte->valid) {
 			pte = ret->pte;
 			*local_xid = pte->local_xid;
 		}
@@ -673,6 +695,8 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 	PeerTxnEntry       *pte;
 	CommitOrderId       coid  = InvalidCommitOrderId;
 	bool                found = false;
+	PteOriginHashEntry *ret;
+	PteOriginHashEntry  skey;
 
 	START_CRIT_SECTION();
 	{
@@ -685,8 +709,12 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		pte = find_entry_for(origin_node_id, origin_xid);
-		if (pte != NULL) {
+		skey.origin_node_id = origin_node_id;
+		skey.origin_xid = origin_xid;
+		ret = (PteOriginHashEntry*)hash_search(PteOriginHash, &skey,
+		                                       HASH_FIND, &found);
+		if (ret != NULL && ret->pte->valid) {
+			pte = ret->pte;
 			coid = pte->local_coid;
 		}
 
@@ -719,7 +747,7 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL && ret->pte->valid) {
 			pte = ret->pte;
 			coid = pte->local_coid;
 		}
@@ -787,6 +815,8 @@ WaitUntilCommittable(void)
 	CommitOrderId  my_coid = InvalidCommitOrderId,
 		           dep_coid;
 	PeerTxnEntry  *pte;
+	PteLocalXidHashEntry *ret;
+	bool found;
 
 	/*
 	 * Short circuit for aborted transactions.
@@ -802,6 +832,12 @@ WaitUntilCommittable(void)
 	 * Lookup the lowest known commit order id
 	 */
 	dep_coid = getLowestKnownCommitOrderId();
+	ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &(MyProc->xid), HASH_FIND, &found);
+	if (ret != NULL && ret->pte->valid) {
+		pte = ret->pte;
+		if (dep_coid < pte->dep_coid)
+			dep_coid = pte->dep_coid;
+	}
 
 	/*
 	 * Loop over all transactions with commit order ids in between the
@@ -827,6 +863,28 @@ WaitUntilCommittable(void)
 			get_local_xid_by_coid(dep_coid, &xid);
 		}
 
+		if (xid == MyProc->xid) {
+			PteLocalCoidHashEntry *tmpentry = NULL;
+			PeerTxnEntry *pte1, *pte2;
+			bool found;
+			tmpentry = (PteLocalCoidHashEntry*) hash_search(PteLocalCoidHash, &my_coid, HASH_FIND, &found);
+			if (tmpentry != NULL) {
+				pte1 = tmpentry->pte;
+			}
+			tmpentry = NULL;
+			tmpentry = (PteLocalCoidHashEntry*) hash_search(PteLocalCoidHash, &dep_coid, HASH_FIND, &found);
+			if (tmpentry != NULL) {
+				pte2 = tmpentry->pte;
+			}
+			elog(PANIC,
+			     "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for itself.\n detail: (%d/%d, %d/%d) waiting for (%d/%d, %d/%d), my_coid=%d, dep_coid=%d",
+			     MyProcPid, MyBackendId, my_coid, MyProc->xid,
+			     pte1->origin_node_id, pte1->origin_xid, pte1->local_xid, pte1->local_coid,
+			     pte2->origin_node_id, pte2->origin_xid, pte2->local_xid, pte2->local_coid,
+			     my_coid, dep_coid
+				);
+		}
+
 		/*
 		 * Wait until the transaction has committed or aborted.
 		 */
@@ -835,8 +893,8 @@ WaitUntilCommittable(void)
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
-			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for txn %d",
-				 MyProcPid, MyBackendId, my_coid, xid);
+			elog(LOG, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d.",
+			     MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
 			pg_usleep(30000L);
 		}
 
