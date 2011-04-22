@@ -363,15 +363,18 @@ cleanPeerTxnEntries()
 	volatile ReplLutCtlData *rctl = ReplLutCtl;
 	int                      i, j;
 	bool                     found;
+	int                      count = 0;
 
 	pte = (PeerTxnEntry*) &rctl[1];
 	for (i = rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
 		if (!(pte[i].commited || pte[i].aborted))
 			continue;
 
+#ifdef DEBUG
 		elog(LOG, "start to valid pte %d [%d, %d, %d, %d] depends one %d < %d", i,
 		     pte[i].origin_node_id, pte[i].origin_xid,
 		     pte[i].local_xid, pte[i].local_coid);
+#endif
 
 		found = false;
 		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
@@ -394,14 +397,18 @@ cleanPeerTxnEntries()
 		if (found)
 			continue;
 		else {
+#ifdef DEBUG
 			elog(LOG, "pte reclaimed %d [%d, %d, %d, %d]", i,
 			     pte[i].origin_node_id, pte[i].origin_xid,
 			     pte[i].local_xid, pte[i].local_coid);
+#endif
+			count += 1;
 			pte[i].valid = false;
 			/* delete the entry in co_txn_info also */
 			erase_co_txn_info(pte[i].origin_node_id, pte[i].origin_xid);
 		}
 	}
+	elog(LOG, "CleanPeerTxnEntries :   Reclaimed %d ptes this time.", count);
 }
 
 void
@@ -610,7 +617,9 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+#ifdef DEBUG
 		elog(LOG, "erase_transaction, is_commit=%d (%d)", is_commit, lowestKnownCommitId);
+#endif
 	}
 	END_CRIT_SECTION();
 }
@@ -869,7 +878,9 @@ WaitUntilCommittable(void)
 		 * Wait until the transaction id is locally known.
 		 */
 		get_local_xid_by_coid(dep_coid, &xid);
+#ifdef DEBUG
 		elog(LOG, "start to check valid for %d/%d", dep_coid, xid);
+#endif
 		while (xid >0 && !TransactionIdIsValid(xid))
 		{
 			if (MyProc->abortFlag)
@@ -886,6 +897,7 @@ WaitUntilCommittable(void)
 			goto next_higher_dep;
 		}
 
+#ifdef DEBUG
 		if (xid == MyProc->xid) {
 			PteLocalCoidHashEntry *tmpentry = NULL;
 			PeerTxnEntry *pte1, *pte2;
@@ -907,6 +919,7 @@ WaitUntilCommittable(void)
 			     my_coid, dep_coid
 				);
 		}
+#endif
 
 		/*
 		 * Wait until the transaction has committed or aborted.
@@ -916,7 +929,7 @@ WaitUntilCommittable(void)
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
-			elog(LOG, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d.",
+			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d.",
 			     MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
 			pg_usleep(30000L);
 		}
