@@ -1159,6 +1159,10 @@ PortalRunUtility(Portal portal, Node *utilityStmt, bool isTopLevel,
 
 	elog(DEBUG3, "ProcessUtility");
 
+	/* liyu: just pass the checkpoint stmt */
+	if (IsA(utilityStmt, CheckPointStmt))
+		return;
+
 	/*
 	 * Set snapshot if utility stmt needs one.	Most reliable way to do this
 	 * seems to be to enumerate those that do not need one; this is a short
@@ -1187,7 +1191,7 @@ PortalRunUtility(Portal portal, Node *utilityStmt, bool isTopLevel,
 	}
 	else
 		active_snapshot_set = false;
-
+		
 	ProcessUtility(utilityStmt,
 				   portal->sourceText,
 				   portal->portalParams,

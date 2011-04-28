@@ -319,9 +319,9 @@ alloc_new_entry()
 		while (i<rctl->ptxn_head) {
 			if (!pte[i].valid) {
 				ret = &pte[i];
-				if (ret->local_coid == lowestKnownCommitId) {
-					lowestKnownCommitId = FirstNormalCommitOrderId;
-				}
+				//if (ret->local_coid == lowestKnownCommitId) {
+				//lowestKnownCommitId = FirstNormalCommitOrderId;
+				//}
 				InitPte(ret);
 				elog(DEBUG1, "alloc_new_entry, reuse no. %d", i);
 				found = true;
@@ -365,9 +365,11 @@ cleanPeerTxnEntries()
 	bool                     found;
 	int                      count = 0;
 
+	SpinLockAcquire(&co_txn_info_lock);
+
 	pte = (PeerTxnEntry*) &rctl[1];
 	for (i = rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
-		if (!(pte[i].commited || pte[i].aborted))
+		if (!pte[i].commited && !pte[i].aborted)
 			continue;
 
 #ifdef DEBUG
@@ -387,7 +389,7 @@ cleanPeerTxnEntries()
 					found =false;
 				if (found)
 					break;
-			}				
+			}
 		}
 		if (pte[i].local_coid == getLowestKnownCommitOrderId())
 		{
@@ -409,6 +411,8 @@ cleanPeerTxnEntries()
 		}
 	}
 	elog(LOG, "CleanPeerTxnEntries :   Reclaimed %d ptes this time.", count);
+
+	SpinLockRelease(&co_txn_info_lock);
 }
 
 void
@@ -477,7 +481,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 	Assert(CommitOrderIdIsValid(local_coid));
 
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG5, "Coordinator: storing origin node %d xid %d -> local coid: %d",
+	elog(DEBUG5, "MyDebug: storing origin node %d xid %d -> local coid: %d",
 		 origin_node_id, origin_xid, local_coid);
 #endif
 
@@ -502,8 +506,8 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
-					pg_usleep(1000);
-					elog(LOG, "Out of space for pte coid, next try.");
+					pg_usleep(1000000);
+					elog(DEBUG1, "Out of space for pte coid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
@@ -520,6 +524,9 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 			else {
 				insertPteHash(pte, PTEHASH_INSERT_COID);
 			}
+
+			elog(LOG, "MyDebug: storing origin node %d xid %d -> local coid: %d",
+			     origin_node_id, origin_xid, local_coid);
 			
 			SpinLockRelease(&rctl->ptxn_lock);
 			break;
@@ -563,8 +570,8 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
-					pg_usleep(1000);
-					elog(LOG, "Out of space for pte xid, next try.");
+					pg_usleep(1000000);
+					elog(DEBUG1, "Out of space for pte xid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
@@ -611,12 +618,21 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		{
 			pte->commited = is_commit;
 			pte->aborted = !is_commit;
-			if (pte->commited && lowestKnownCommitId < pte->local_coid) {
+			if ((pte->commited || pte->aborted)
+			    && lowestKnownCommitId < pte->local_coid)
+			{
 				lowestKnownCommitId = pte->local_coid;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
+		if (pte)
+		{
+		elog(LOG, "MyDebug: erase_transaction origin %d/%d, xid %d, coid %d, is_commit=%d (%d)", 
+		     pte->origin_node_id, pte->origin_xid,
+		     pte->local_xid, pte->local_coid,
+		     is_commit, lowestKnownCommitId);
+		}
 #ifdef DEBUG
 		elog(LOG, "erase_transaction, is_commit=%d (%d)", is_commit, lowestKnownCommitId);
 #endif
@@ -852,6 +868,12 @@ WaitUntilCommittable(void)
 		goto abort_waiting;
 
 	my_coid = get_local_coid_by_local_xid(MyProc->xid);
+	if (my_coid < 0)
+	{
+		elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
+		     MyProcPid, MyBackendId, my_coid);
+		elog(PANIC, "Panic!");
+	}
 	elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
 		 MyProcPid, MyBackendId, my_coid);
 
@@ -888,7 +910,7 @@ WaitUntilCommittable(void)
 
 			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for coid %d",
 				 MyProcPid, MyBackendId, my_coid, dep_coid);
-			pg_usleep(30000L);
+			pg_usleep(1000000L);
 
 			get_local_xid_by_coid(dep_coid, &xid);
 		}
@@ -924,6 +946,7 @@ WaitUntilCommittable(void)
 		/*
 		 * Wait until the transaction has committed or aborted.
 		 */
+		int counter = 0;
 		while (TransactionIdIsInProgress(xid))
 		{
 			if (MyProc->abortFlag)
@@ -931,7 +954,15 @@ WaitUntilCommittable(void)
 
 			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d.",
 			     MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
-			pg_usleep(30000L);
+			pg_usleep(1000000L);
+			counter += 1;
+			if (counter >= 20)
+			{
+				elog(LOG, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d too long, to abort.",
+					MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
+				MyProc->abortFlag = true;
+				break;
+			}
 		}
 
 		/* increment to process the next higher coid */
@@ -1103,10 +1134,10 @@ retry:
 
 		if (others_pid != 0)
 		{
-#ifdef DEBUG_CSET_APPL
-			elog(DEBUG5, "bg worker [%d/%d]: waiting for txn %d, pid %d",
-				 MyProcPid, MyBackendId, others_xid, others_pid);
-#endif
+//#ifdef DEBUG_CSET_APPL
+			elog(LOG, "bg worker [%d/%d]: xid %d coid %d waiting for txn %d, pid %d",
+			     MyProcPid, MyBackendId, MyProc->xid, my_coid, others_xid, others_pid);
+//#endif
 
 			/*
 			 * A process for the conflicting transaction with id others_xid

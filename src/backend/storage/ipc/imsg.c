@@ -231,7 +231,7 @@ IMessageCreate(IMessageType type, int msg_size)
 
 		printIMessageCtlInfo();
 
-		/* elog(PANIC, "we should stop here!"); */
+		elog(PANIC, "we should stop here!");
 
 		pg_usleep(100000);
 	}
