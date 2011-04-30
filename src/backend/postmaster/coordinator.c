@@ -538,14 +538,14 @@ dispatch_job(IMessage *msg, co_database *codb)
 
 	if (is_from_local_node)
 	{
-		if (can_deliver)
+		if (can_deliver && target != InvalidBackendId)
 			forward_job(msg, codb, target);
 		else
 			cache_job(msg, codb);
 	}
 	else
 	{
-		if (wi != NULL && can_deliver)
+		if (wi != NULL && wi->idle && can_deliver)
 			forward_job(msg, codb, wi->wi_backend_id);
 		else
 			cache_job(msg, codb);
@@ -575,14 +575,14 @@ dispatch_ooo_msg(IMessage *msg, co_database *codb)
 
 	if (is_from_local_node)
 	{
-		if (can_deliver)
+		if (can_deliver && target != InvalidBackendId)
 			forward_job(msg, codb, target);
 		else
 			add_ooo_msg(msg, codb, InvalidBackendId);
 	}
 	else
 	{
-		if (wi != NULL && can_deliver)
+		if (wi != NULL && wi->idle && can_deliver)
 			forward_job(msg, codb, wi->wi_backend_id);
 		else
 			add_ooo_msg(msg, codb, InvalidBackendId);
@@ -627,7 +627,7 @@ process_cached_jobs(co_database *codb)
 		group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
 		bool is_from_local_node = (sender_node->id == origin_node_id);
 
-		if (!is_from_local_node && wi != NULL && can_deliver)
+		if (!is_from_local_node && wi != NULL && can_deliver && wi->idle)
 		{
 			/* remove the job from the cache */
 			DLRemove(&job->cj_links);
@@ -645,7 +645,7 @@ process_cached_jobs(co_database *codb)
 			
 			job = (cached_job*) DLGetHead(&codb->codb_cached_jobs);
 		}
-		else if (is_from_local_node && can_deliver)
+		else if (is_from_local_node && can_deliver && target != InvalidBackendId)
 		{
 			DLRemove(&job->cj_links);
 			codb->codb_num_cached_jobs--;
@@ -696,7 +696,7 @@ process_ooo_msgs_for(co_database *codb, BackendId backend_id)
 		group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
 		bool is_from_local_node = (sender_node->id == origin_node_id);
 
-		if (!is_from_local_node && wi != NULL && can_deliver)
+		if (!is_from_local_node && wi != NULL && can_deliver && wi->idle)
 		{
 			/* remove the message from the cache */
 			DLRemove(&cm->cm_links);
@@ -708,7 +708,7 @@ process_ooo_msgs_for(co_database *codb, BackendId backend_id)
 			/* re-scan the list of ooo messages */
 			cm = (cached_msg*) DLGetHead(&codb->codb_ooo_msgs);
 		}
-		else if(is_from_local_node && can_deliver)
+		else if(is_from_local_node && can_deliver && target != InvalidBackendId)
 		{
 			DLRemove(&cm->cm_links);
 			codb->codb_num_ooo_msgs--;
@@ -1163,8 +1163,8 @@ CoordinatorMain(int argc, char *argv[])
 		 * Periodically check and trigger autovacuum workers, if autovacuum
 		 * is enabled.
 		 */
-		/* if (autovacuum_enabled) */
-		/* 	autovacuum_maybe_trigger_job(current_time, can_launch); */
+		if (autovacuum_enabled)
+			autovacuum_maybe_trigger_job(current_time, can_launch);
 
 		manage_workers(can_launch);
 
@@ -1405,142 +1405,6 @@ can_deliver_cached_job(co_database *codb, IMessage *msg, BackendId *target)
 			return false;
 	}
 }
-
-/*
- * manage_workers
- *
- * Starts background workers for databases which have at least one cached
- * job or which have less than min_background_workers connected. Within the
- * same loop, the max_background_workers is checked and terminates a worker
- * accordingly.
- * 
- * Note that at max one worker can be requested to start or stop per
- * invocation.
- */
-/* static void */
-/* manage_workers(bool can_launch) */
-/* { */
-/* 	HASH_SEQ_STATUS			hash_status; */
-/* 	co_database	           *codb; */
-/* 	Oid                     launch_dboid = InvalidOid; */
-/* 	float                   max_score = 0.0, */
-/* 		                    score; */
-/* 	bool                    worker_slots_available; */
-/* 	int                     idle_workers_required; */
-/* 	int                     job_workers_required; */
-
-/* 	LWLockAcquire(WorkerInfoLock, LW_SHARED); */
-/* 	worker_slots_available = (CoordinatorShmem->co_freeWorkers != NULL); */
-/* 	LWLockRelease(WorkerInfoLock); */
-
-/* 	/\* */
-/* 	 * Terminate an unneeded worker that has been fetched from the list of */
-/* 	 * idle workers in the last invocation. We defer sending the signal one */
-/* 	 * invocation to make sure the coordinator had time to handle all */
-/* 	 * pending messages from that worker. As idle workers don't ever send */
-/* 	 * messages, we can safely assume there is no pending message from that */
-/* 	 * worker by now. */
-/* 	 *\/ */
-/* 	if (terminatable_worker != NULL) */
-/* 	{ */
-/* 		IMessage *msg; */
-
-/* #ifdef COORDINATOR_DEBUG */
-/* 		PGPROC *proc = BackendIdGetProc(terminatable_worker->wi_backend_id); */
-/* 		if (proc) */
-/* 			elog(DEBUG3, "Coordinator: terminating worker [%d/%d].", */
-/* 				 proc->pid, terminatable_worker->wi_backend_id); */
-/* 		else */
-/* 			elog(WARNING, "Coordinator: terminating worker (no PGPROC, backend %d).", */
-/* 				 terminatable_worker->wi_backend_id); */
-/* #endif */
-
-/* 		msg = IMessageCreate(IMSGT_TERM_WORKER, 0); */
-/* 		IMessageActivate(msg, terminatable_worker->wi_backend_id); */
-
-/* 		terminatable_worker = NULL; */
-/* 	} */
-
-/* #ifdef COORDINATOR_DEBUG */
-/* 	elog(DEBUG3, "Coordinator: manage_workers: can_launch: %s, slots_available: %s", */
-/* 		 (can_launch ? "true" : "false"), (worker_slots_available ? "true" : "false")); */
-/* #endif */
-
-/* 	/\* */
-/* 	 * Check the list of databases and fire the first pending request */
-/* 	 * we find. */
-/* 	 *\/ */
-/* 	idle_workers_required = 0; */
-/* 	job_workers_required = 0; */
-/* 	LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED); */
-/* 	hash_seq_init(&hash_status, co_databases); */
-/* 	while ((codb = (co_database*) hash_seq_search(&hash_status))) */
-/* 	{ */
-/* 		score = ((float) codb->codb_num_cached_jobs / */
-/* 				 (float) (codb->codb_num_connected_workers + 1)) * 100.0; */
-
-/* 		if (codb->codb_num_idle_workers < min_spare_background_workers) */
-/* 			score += (min_spare_background_workers - */
-/* 					  codb->codb_num_idle_workers) * 10.0; */
-
-/* #ifdef COORDINATOR_DEBUG */
-/* 		elog(DEBUG3, "Coordinator:     db %d, idle/conn: %d/%d, jobs: %d, score: %0.1f", */
-/* 			 codb->codb_dboid, codb->codb_num_idle_workers, */
-/* 			 codb->codb_num_connected_workers, codb->codb_num_cached_jobs, */
-/* 			 score); */
-/* #endif */
-
-/* 		if (codb->codb_num_cached_jobs && */
-/* 			(codb->codb_num_connected_workers == 0)) */
-/* 			job_workers_required++; */
-
-/* 		if (codb->codb_num_idle_workers < min_spare_background_workers) */
-/* 			idle_workers_required += (min_spare_background_workers - */
-/* 									  codb->codb_num_idle_workers); */
-
-/* 		/\* */
-/* 		 * FIXME: "misconfiguration" allows "starvation" in case the global */
-/* 		 *        maximum is reached all with idle workers, but other dbs */
-/* 		 *        w/o a single worker still have jobs. */
-/* 		 *\/ */
-/* 		if (can_launch && ((codb->codb_num_cached_jobs > 0) || */
-/* 						   (codb->codb_num_idle_workers < */
-/* 							min_spare_background_workers))) */
-/* 		{ */
-/* 			if (can_launch && (score > max_score)) */
-/* 			{ */
-/* 				launch_dboid = codb->codb_dboid; */
-/* 				max_score = score; */
-/* 			} */
-/* 		} */
-
-/* 		/\* */
-/* 		 * If we are above limit, we fetch an idle worker from the list */
-/* 		 * and mark it as terminatable. Actual termination happens in */
-/* 		 * the following invocation, see above. */
-/* 		 *\/ */
-/* 		if ((terminatable_worker == NULL) && */
-/* 			(codb->codb_num_idle_workers > max_spare_background_workers)) */
-/* 			terminatable_worker = get_idle_worker(codb, -1); /\* just pass -1 as original_node since at this time we do not need it. *\/ */
-/* 	} */
-/* 	LWLockRelease(CoordinatorDatabasesLock); */
-
-/* 	if (!worker_slots_available && idle_workers_required > 0) */
-/* 	{ */
-/* 		elog(WARNING, "Coordinator: no more background workers available, but requiring %d more, according to min_spare_background_workers.", */
-/* 			 idle_workers_required); */
-/* 	} */
-
-/* 	if (!worker_slots_available && job_workers_required > 0) */
-/* 	{ */
-/* 		elog(WARNING, "Coordinator: no background workers avalibale, but %d databases have background jobs pending.", */
-/* 			 job_workers_required); */
-/* 	} */
-
-/* 	/\* request a worker for the first database found, which needs one *\/ */
-/* 	if (OidIsValid(launch_dboid)) */
-/* 		do_start_worker(launch_dboid); */
-/* } */
 
 static void
 manage_workers(bool can_launch)
