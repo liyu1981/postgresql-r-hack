@@ -78,6 +78,8 @@ typedef struct WorkerInfoData
 	worker_state wi_state;
 
 	NodeId origin_node_id;
+	bool idle;
+	bool started;
 
 	/* autovacuum specific fields */
 	Oid			wi_tableoid;
