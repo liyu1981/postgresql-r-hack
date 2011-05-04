@@ -55,6 +55,8 @@ typedef struct PeerTxnEntry
 	TransactionId   dep_coid;
 } PeerTxnEntry;
 
+#define IsPteValid(p) ((p)->valid && !(p)->commited && !(p)->aborted)
+
 typedef struct PteOriginHashEntry
 {
 	TransactionId origin_node_id;
@@ -525,7 +527,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 				insertPteHash(pte, PTEHASH_INSERT_COID);
 			}
 
-			elog(LOG, "MyDebug: storing origin node %d xid %d -> local coid: %d",
+			elog(DEBUG3, "MyDebug: storing origin node %d xid %d -> local coid: %d",
 			     origin_node_id, origin_xid, local_coid);
 			
 			SpinLockRelease(&rctl->ptxn_lock);
@@ -680,7 +682,7 @@ get_origin_by_local_xid(TransactionId local_xid,
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL && ret->pte->valid) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			*origin_node_id = pte->origin_node_id;
 			*origin_xid = pte->origin_xid;
@@ -721,7 +723,7 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &coid,
 		                                          HASH_FIND, &found);
-		if (ret != NULL & ret->pte->valid) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			*local_xid = pte->local_xid;
 		}
@@ -756,7 +758,7 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 		skey.origin_xid = origin_xid;
 		ret = (PteOriginHashEntry*)hash_search(PteOriginHash, &skey,
 		                                       HASH_FIND, &found);
-		if (ret != NULL && ret->pte->valid) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			coid = pte->local_coid;
 		}
@@ -790,7 +792,7 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL && ret->pte->valid) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			coid = pte->local_coid;
 		}
