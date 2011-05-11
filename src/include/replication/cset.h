@@ -30,8 +30,8 @@
 #include "utils/tqual.h"
 #include "utils/rel.h"
 
-#define CSET_SIZE_LIMIT 8128
-
+//#define CSET_SIZE_LIMIT 16320
+#define CSET_SIZE_LIMIT 65472
 
 typedef enum CsetCmdType
 {
