@@ -102,6 +102,13 @@ istream_prepare_for_reading(IStreamReader reader, int size)
 		Assert(reader->msg);
 
 		/* FIXME: error detection */
+		if (reader->msg->type == IMSGT_TXN_ABORTED)
+		{
+			elog(LOG, "bg worker [%d/%d]: got abort message",
+				 MyProcPid, MyBackendId);
+			return;
+		}
+
 		if (reader->msg->type != reader->msg_type)
 			elog(WARNING, "bg worker [%d/%d]: unexpected message type: %s",
 				 MyProcPid, MyBackendId,
@@ -168,6 +175,9 @@ istream_read_data(IStreamReader reader, void *ptr, int size)
 		istream_prepare_for_reading(reader, 1);
 		avail = get_bytes_read(b);
 #endif
+		if (reader->msg->type == IMSGT_TXN_ABORTED)
+			break;
+
 		if (size < avail)
 			avail = size;
 

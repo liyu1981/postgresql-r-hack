@@ -890,7 +890,7 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 		Assert(group);
 		Assert(group->gcsi);
 
-		get_int32(b);	/* skip the additional node id */
+		origin_node_id = get_int32(b);	/* skip the additional node id */
 		origin_xid = get_int32(b);
 		get_int32(b); /* skip the errcode */
 
@@ -899,22 +899,34 @@ coordinator_handle_gc_message(gcs_group *group, group_node *sender_node,
 			 sender_node->id, origin_xid);
 #endif
 
-		xi = get_co_transaction_info(sender_node->id, origin_xid);
-		xi->aborted = true;
-
-		/*
-		 * Drop all pending local ooo messages for this transaction.
-		 */
-		LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED);
-		codb = hash_search(co_databases, &group->dboid, HASH_FIND, NULL);
-		Assert(codb);
-		if (xi->local_backend_id != InvalidBackendId)
-			drop_ooo_msgs_for(codb, xi->local_backend_id);
-		LWLockRelease(CoordinatorDatabasesLock);
+		if (!group->gcsi->funcs.is_local(group, sender_node))
+		{
+			xi = get_co_transaction_info(sender_node->id, origin_xid);
+			// xi->aborted = true;
+			
+			/*
+			 * Drop all pending local ooo messages for this transaction.
+			 */
+			LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED);
+			codb = hash_search(co_databases, &group->dboid, HASH_FIND, NULL);
+			Assert(codb);
+			if (xi->local_backend_id != InvalidBackendId)
+				drop_ooo_msgs_for(codb, xi->local_backend_id);
+			LWLockRelease(CoordinatorDatabasesLock);
+		}
 
 		/* turn the gc message into an imessage */
 		msg = convert_to_imessage(msg_type, sender_node,
 								  start_of_msg, msg_size);
+
+		/* liyu: hack! for not local nodes, modify fake origin_node_id field */
+		if (!group->gcsi->funcs.is_local(group, sender_node))
+		{
+			buffer b;
+			IMessageGetWriteBuffer(&b, msg);
+			get_int32(&b);
+			put_int32(&b, sender_node->id);
+		}
 
 		dispatch_ooo_msg(msg, codb);
 	}
@@ -1575,10 +1587,10 @@ handle_imessage_txn_aborted(gcs_group *group, IMessage *msg)
 	}
 #endif
 
-	xi = get_co_transaction_info(origin_node_id, origin_xid);
+	//xi = get_co_transaction_info(origin_node_id, origin_xid);
 	/* liyu: FIXME, very dirty hack */
 	/* Assert(xi->local_backend_id == msg->sender); */
-	xi->aborted = true;
+	//xi->aborted = true;
 
 	/*
 	 * For local transactions we need to multicast this abort message,
@@ -1590,8 +1602,9 @@ handle_imessage_txn_aborted(gcs_group *group, IMessage *msg)
 	 * conflict, before receiving the TXN_ABORTED message from the
 	 * origin node.
 	 */
-	local_node = group->gcsi->funcs.get_local_node(group);
-	if (xi->origin_node_id == local_node->id)
+	//local_node = group->gcsi->funcs.get_local_node(group);
+	//if (xi->origin_node_id == local_node->id)
+	if (origin_node_id != 0)
 		gc_broadcast_imsg(group, msg, false);
 
 	/*
@@ -1603,7 +1616,8 @@ handle_imessage_txn_aborted(gcs_group *group, IMessage *msg)
 	drop_ooo_msgs_for(codb, msg->sender);
 	LWLockRelease(CoordinatorDatabasesLock);
 
-	erase_transaction(origin_node_id, origin_xid, false);
+	if (origin_node_id != 0)
+		erase_transaction(origin_node_id, origin_xid, false);
 
 	/*
 	 * Return the TXN_ABORTED message to the backend, so it knows the

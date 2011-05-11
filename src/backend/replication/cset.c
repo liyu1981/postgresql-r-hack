@@ -129,6 +129,12 @@ deserialize_tuple_attr(IStreamReader reader, TupleDesc tdesc, Datum *attr, int a
 	str[size] = 0;
 	Assert(strlen(str) == size);
 
+	if (reader->msg->type == IMSGT_TXN_ABORTED)
+	{
+		*attr = 'a';
+		return;
+	}
+
 	if (attnum > 0)
 		typid = tdesc->attrs[attnum - 1]->atttypid;
 	else
@@ -262,6 +268,9 @@ deserialize_tuple_changes(IStreamReader reader, TupleDesc tdesc,
 				nulls[i] = FALSE;
 				deserialize_tuple_attr(reader, tdesc, &values[i], attnum);
 				break;
+
+        	case 'a':     /* got abort */
+		        break;
 
 			default:
 				Assert(FALSE);

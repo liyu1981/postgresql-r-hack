@@ -127,13 +127,14 @@ send_txn_aborted_msg(TransactionId xid, int errcode)
 	coordinator_id = GetCoordinatorId();
 	if (coordinator_id != InvalidBackendId)
 	{
-		get_origin_by_local_xid(xid, &origin_node_id, &origin_xid);
+		//get_origin_by_local_xid(xid, &origin_node_id, &origin_xid);
 
 		msg = IMessageCreate(IMSGT_TXN_ABORTED, size);
 		init_buffer(&b, IMSG_DATA(msg), size);
 
-		put_int32(&b, origin_node_id);
-		put_int32(&b, origin_xid);
+		//put_int32(&b, origin_node_id);
+		put_int32(&b, 0);
+		put_int32(&b, GetCurrentTransactionId());
 		put_int32(&b, errcode);
 
 		IMessageActivate(msg, coordinator_id);

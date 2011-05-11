@@ -578,14 +578,14 @@ dispatch_ooo_msg(IMessage *msg, co_database *codb)
 		if (can_deliver && target != InvalidBackendId)
 			forward_job(msg, codb, target);
 		else
-			add_ooo_msg(msg, codb, InvalidBackendId);
+			add_ooo_msg(msg, codb, target);
 	}
 	else
 	{
 		if (wi != NULL && wi->idle && can_deliver)
 			forward_job(msg, codb, wi->wi_backend_id);
 		else
-			add_ooo_msg(msg, codb, InvalidBackendId);
+			add_ooo_msg(msg, codb, wi->wi_backend_id);
 	}
 }
 
@@ -1818,11 +1818,6 @@ bgworker_reset(void)
 	MyProc->abortFlag = false;
 	BgWorkerCleanupInProgress = false;
 
-	/* propagate as idle worker, inform the coordinator */
-	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
-	add_as_idle_worker(MyWorkerInfo, MyDatabaseId, false);
-	LWLockRelease(WorkerInfoLock);
-
 	CoordinatorId = GetCoordinatorId();
 	if (CoordinatorId != InvalidBackendId)
 	{
@@ -1832,6 +1827,11 @@ bgworker_reset(void)
 	else
 		elog(WARNING, "bg worker [%d/%d]: no coordinator?!?",
 			 MyProcPid, MyBackendId);
+
+	/* propagate as idle worker, inform the coordinator */
+	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
+	add_as_idle_worker(MyWorkerInfo, MyDatabaseId, false);
+	LWLockRelease(WorkerInfoLock);
 }
 
 void
