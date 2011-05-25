@@ -55,6 +55,8 @@ typedef struct PeerTxnEntry
 	TransactionId   dep_coid;
 } PeerTxnEntry;
 
+#define IsPteValid(p) ((p)->valid && !(p)->commited && !(p)->aborted)
+
 typedef struct PteOriginHashEntry
 {
 	TransactionId origin_node_id;
@@ -136,6 +138,10 @@ void
 InitPte(PeerTxnEntry *pte)
 {
 	pte->origin_node_id = InvalidNodeId;
+	pte->origin_xid = 0;
+	pte->local_coid = InvalidCommitOrderId;
+	pte->local_xid = 0;
+
 	pte->valid = false;
 	pte->commited = false;
 	pte->aborted = false;
@@ -315,9 +321,9 @@ alloc_new_entry()
 		while (i<rctl->ptxn_head) {
 			if (!pte[i].valid) {
 				ret = &pte[i];
-				if (ret->local_coid == lowestKnownCommitId) {
-					lowestKnownCommitId = FirstNormalCommitOrderId;
-				}
+				//if (ret->local_coid == lowestKnownCommitId) {
+				//lowestKnownCommitId = FirstNormalCommitOrderId;
+				//}
 				InitPte(ret);
 				elog(DEBUG1, "alloc_new_entry, reuse no. %d", i);
 				found = true;
@@ -359,31 +365,56 @@ cleanPeerTxnEntries()
 	volatile ReplLutCtlData *rctl = ReplLutCtl;
 	int                      i, j;
 	bool                     found;
+	int                      count = 0;
+
+	SpinLockAcquire(&co_txn_info_lock);
 
 	pte = (PeerTxnEntry*) &rctl[1];
 	for (i = rctl->ptxn_tail; i<rctl->ptxn_head; ++i) {
-		if (!(pte[i].commited || pte[i].aborted))
+		if (!pte[i].commited && !pte[i].aborted)
 			continue;
+
+#ifdef DEBUG
+		elog(LOG, "start to valid pte %d [%d, %d, %d, %d] depends one %d < %d", i,
+		     pte[i].origin_node_id, pte[i].origin_xid,
+		     pte[i].local_xid, pte[i].local_coid);
+#endif
 
 		found = false;
 		for (j=rctl->ptxn_tail; j<rctl->ptxn_head; ++j) {
-			if (pte[j].dep_coid == pte[i].local_coid &&
-			    !(pte[j].commited || pte[j].aborted)) {
+			if (pte[j].dep_coid <= pte[i].local_coid) {
+				/*elog(LOG, "found small pte %d [%d, %d, %d, %d] depends one %d < %d", i,
+				     pte[j].origin_node_id, pte[j].origin_xid,
+				     pte[j].local_xid, pte[j].local_coid, pte[j].dep_coid, pte[i].local_coid);*/
 				found = true;
-				break;
-			}				
+				if (pte[j].commited || pte[j].aborted)
+					found =false;
+				if (found)
+					break;
+			}
+		}
+		if (pte[i].local_coid == getLowestKnownCommitOrderId())
+		{
+			// we can not clean this one, since some concurrent txn may start to rely on it
+			found = true;
 		}
 		if (found)
 			continue;
 		else {
-			elog(DEBUG1, "pte reclaimed %d [%d, %d, %d, %d]", i,
+#ifdef DEBUG
+			elog(LOG, "pte reclaimed %d [%d, %d, %d, %d]", i,
 			     pte[i].origin_node_id, pte[i].origin_xid,
 			     pte[i].local_xid, pte[i].local_coid);
+#endif
+			count += 1;
 			pte[i].valid = false;
 			/* delete the entry in co_txn_info also */
 			erase_co_txn_info(pte[i].origin_node_id, pte[i].origin_xid);
 		}
 	}
+	elog(LOG, "CleanPeerTxnEntries :   Reclaimed %d ptes this time.", count);
+
+	SpinLockRelease(&co_txn_info_lock);
 }
 
 void
@@ -452,7 +483,7 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 	Assert(CommitOrderIdIsValid(local_coid));
 
 #ifdef COORDINATOR_DEBUG
-	elog(DEBUG5, "Coordinator: storing origin node %d xid %d -> local coid: %d",
+	elog(DEBUG5, "MyDebug: storing origin node %d xid %d -> local coid: %d",
 		 origin_node_id, origin_xid, local_coid);
 #endif
 
@@ -465,28 +496,39 @@ store_transaction_coid(NodeId origin_node_id, TransactionId origin_xid,
 			SpinLockAcquire(&rctl->ptxn_lock);
 
 			pte = find_entry_for(origin_node_id, origin_xid);
+
+			if (pte && pte->local_coid != InvalidCommitOrderId) {
+				elog(LOG, "Pte (%d/%d) with txn %d already have a coid %d associated.",
+				     pte->origin_node_id, pte->origin_xid, pte->local_xid, pte->local_coid);
+				elog(PANIC, "Must die.");
+			}
+
 			if (!pte)
 			{
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
-					pg_usleep(1000);
+					pg_usleep(1000000);
+					elog(DEBUG1, "Out of space for pte coid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
 				pte->origin_xid = origin_xid;
 				pte->local_xid = InvalidTransactionId;
+				pte->dep_coid = getLowestKnownCommitOrderId();
 				newflag = true;
 			}
 
 			pte->local_coid = local_coid;
-			pte->dep_coid = getLowestKnownCommitOrderId();
 			if (newflag) {
 				insertPteHash(pte, PTEHASH_INSERT_ORIGIN | PTEHASH_INSERT_COID);
 			}
 			else {
 				insertPteHash(pte, PTEHASH_INSERT_COID);
 			}
+
+			elog(DEBUG3, "MyDebug: storing origin node %d xid %d -> local coid: %d",
+			     origin_node_id, origin_xid, local_coid);
 			
 			SpinLockRelease(&rctl->ptxn_lock);
 			break;
@@ -518,12 +560,20 @@ store_transaction_local_xid(NodeId origin_node_id, TransactionId origin_xid,
 			SpinLockAcquire(&rctl->ptxn_lock);
 
 			pte = find_entry_for(origin_node_id, origin_xid);
+
+			if (pte && pte->local_xid > 0) {
+				elog(LOG, "Pte (%d/%d) with coid %d already have a txn %d associated.",
+				     pte->origin_node_id, pte->origin_xid, pte->local_coid, pte->local_xid);
+				elog(PANIC, "Must die.");
+			}
+			
 			if (!pte)
 			{
 				pte = alloc_new_entry();
 				if (pte == NULL) {
 					SpinLockRelease(&rctl->ptxn_lock);
-					pg_usleep(1000);
+					pg_usleep(1000000);
+					elog(DEBUG1, "Out of space for pte xid, next try.");
 					continue;
 				}
 				pte->origin_node_id = origin_node_id;
@@ -570,13 +620,24 @@ erase_transaction(NodeId origin_node_id, TransactionId origin_xid, bool is_commi
 		{
 			pte->commited = is_commit;
 			pte->aborted = !is_commit;
-			if (pte->commited && lowestKnownCommitId < pte->local_coid) {
+			if ((pte->commited || pte->aborted)
+			    && lowestKnownCommitId < pte->local_coid)
+			{
 				lowestKnownCommitId = pte->local_coid;
 			}
 		}
 
 		SpinLockRelease(&rctl->ptxn_lock);
-		elog(DEBUG1, "erase_transaction, is_commit=%d", is_commit);
+		if (pte)
+		{
+		elog(LOG, "MyDebug: erase_transaction origin %d/%d, xid %d, coid %d, is_commit=%d (%d)", 
+		     pte->origin_node_id, pte->origin_xid,
+		     pte->local_xid, pte->local_coid,
+		     is_commit, lowestKnownCommitId);
+		}
+#ifdef DEBUG
+		elog(LOG, "erase_transaction, is_commit=%d (%d)", is_commit, lowestKnownCommitId);
+#endif
 	}
 	END_CRIT_SECTION();
 }
@@ -621,7 +682,7 @@ get_origin_by_local_xid(TransactionId local_xid,
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			*origin_node_id = pte->origin_node_id;
 			*origin_xid = pte->origin_xid;
@@ -643,6 +704,12 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 
 	*local_xid = InvalidTransactionId;
 
+	if (coid < getLowestKnownCommitOrderId())
+	{
+		*local_xid = -1; /* means no need to wait */
+		return;
+	}
+
 	START_CRIT_SECTION();
 	{
 		/* use volatile pointer to prevent code rearrangement */
@@ -656,7 +723,7 @@ get_local_xid_by_coid(CommitOrderId coid, TransactionId *local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalCoidHashEntry*)hash_search(PteLocalCoidHash, &coid,
 		                                          HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			*local_xid = pte->local_xid;
 		}
@@ -673,6 +740,8 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 	PeerTxnEntry       *pte;
 	CommitOrderId       coid  = InvalidCommitOrderId;
 	bool                found = false;
+	PteOriginHashEntry *ret;
+	PteOriginHashEntry  skey;
 
 	START_CRIT_SECTION();
 	{
@@ -685,8 +754,12 @@ get_local_coid_by_origin(NodeId origin_node_id, TransactionId origin_xid)
 
 		/* we don't support wrapping, yet */
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
-		pte = find_entry_for(origin_node_id, origin_xid);
-		if (pte != NULL) {
+		skey.origin_node_id = origin_node_id;
+		skey.origin_xid = origin_xid;
+		ret = (PteOriginHashEntry*)hash_search(PteOriginHash, &skey,
+		                                       HASH_FIND, &found);
+		if (ret != NULL && IsPteValid(ret->pte)) {
+			pte = ret->pte;
 			coid = pte->local_coid;
 		}
 
@@ -719,7 +792,7 @@ get_local_coid_by_local_xid(TransactionId local_xid)
 		Assert(rctl->ptxn_head >= rctl->ptxn_tail);
 		ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &local_xid,
 		                                         HASH_FIND, &found);
-		if (ret != NULL) {
+		if (ret != NULL && IsPteValid(ret->pte)) {
 			pte = ret->pte;
 			coid = pte->local_coid;
 		}
@@ -787,6 +860,8 @@ WaitUntilCommittable(void)
 	CommitOrderId  my_coid = InvalidCommitOrderId,
 		           dep_coid;
 	PeerTxnEntry  *pte;
+	PteLocalXidHashEntry *ret;
+	bool found;
 
 	/*
 	 * Short circuit for aborted transactions.
@@ -795,6 +870,12 @@ WaitUntilCommittable(void)
 		goto abort_waiting;
 
 	my_coid = get_local_coid_by_local_xid(MyProc->xid);
+	if (my_coid < 0)
+	{
+		elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
+		     MyProcPid, MyBackendId, my_coid);
+		elog(PANIC, "Panic!");
+	}
 	elog(DEBUG1, "bg worker [%d/%d]: WaitUntilCommittable(): we have commit order id %d",
 		 MyProcPid, MyBackendId, my_coid);
 
@@ -802,6 +883,12 @@ WaitUntilCommittable(void)
 	 * Lookup the lowest known commit order id
 	 */
 	dep_coid = getLowestKnownCommitOrderId();
+	ret = (PteLocalXidHashEntry*)hash_search(PteLocalXidHash, &(MyProc->xid), HASH_FIND, &found);
+	if (ret != NULL && ret->pte->valid) {
+		pte = ret->pte;
+		if (dep_coid < pte->dep_coid)
+			dep_coid = pte->dep_coid;
+	}
 
 	/*
 	 * Loop over all transactions with commit order ids in between the
@@ -815,32 +902,73 @@ WaitUntilCommittable(void)
 		 * Wait until the transaction id is locally known.
 		 */
 		get_local_xid_by_coid(dep_coid, &xid);
-		while (!TransactionIdIsValid(xid))
+#ifdef DEBUG
+		elog(LOG, "start to check valid for %d/%d", dep_coid, xid);
+#endif
+		while (xid >0 && !TransactionIdIsValid(xid))
 		{
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
 			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for coid %d",
 				 MyProcPid, MyBackendId, my_coid, dep_coid);
-			pg_usleep(30000L);
+			pg_usleep(1000000L);
 
 			get_local_xid_by_coid(dep_coid, &xid);
 		}
 
+		if (xid <= 0) {
+			goto next_higher_dep;
+		}
+
+#ifdef DEBUG
+		if (xid == MyProc->xid) {
+			PteLocalCoidHashEntry *tmpentry = NULL;
+			PeerTxnEntry *pte1, *pte2;
+			bool found;
+			tmpentry = (PteLocalCoidHashEntry*) hash_search(PteLocalCoidHash, &my_coid, HASH_FIND, &found);
+			if (tmpentry != NULL) {
+				pte1 = tmpentry->pte;
+			}
+			tmpentry = NULL;
+			tmpentry = (PteLocalCoidHashEntry*) hash_search(PteLocalCoidHash, &dep_coid, HASH_FIND, &found);
+			if (tmpentry != NULL) {
+				pte2 = tmpentry->pte;
+			}
+			elog(PANIC,
+			     "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for itself.\n detail: (%d/%d, %d/%d) waiting for (%d/%d, %d/%d), my_coid=%d, dep_coid=%d",
+			     MyProcPid, MyBackendId, my_coid, MyProc->xid,
+			     pte1->origin_node_id, pte1->origin_xid, pte1->local_xid, pte1->local_coid,
+			     pte2->origin_node_id, pte2->origin_xid, pte2->local_xid, pte2->local_coid,
+			     my_coid, dep_coid
+				);
+		}
+#endif
+
 		/*
 		 * Wait until the transaction has committed or aborted.
 		 */
+		int counter = 0;
 		while (TransactionIdIsInProgress(xid))
 		{
 			if (MyProc->abortFlag)
 				goto abort_waiting;
 
-			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): coid %d: waiting for txn %d",
-				 MyProcPid, MyBackendId, my_coid, xid);
-			pg_usleep(30000L);
+			elog(DEBUG3, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d.",
+			     MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
+			pg_usleep(1000000L);
+			counter += 1;
+			if (counter >= 20)
+			{
+				elog(LOG, "bg worker [%d/%d]: WaitUntilCommittable(): txn %d/%d: waiting for txn %d/%d too long, to abort.",
+					MyProcPid, MyBackendId, my_coid, MyProc->xid, dep_coid, xid);
+				MyProc->abortFlag = true;
+				break;
+			}
 		}
 
 		/* increment to process the next higher coid */
+	next_higher_dep:
 		dep_coid++;
 	}
 
@@ -1008,10 +1136,10 @@ retry:
 
 		if (others_pid != 0)
 		{
-#ifdef DEBUG_CSET_APPL
-			elog(DEBUG5, "bg worker [%d/%d]: waiting for txn %d, pid %d",
-				 MyProcPid, MyBackendId, others_xid, others_pid);
-#endif
+//#ifdef DEBUG_CSET_APPL
+			elog(LOG, "bg worker [%d/%d]: xid %d coid %d waiting for txn %d, pid %d",
+			     MyProcPid, MyBackendId, MyProc->xid, my_coid, others_xid, others_pid);
+//#endif
 
 			/*
 			 * A process for the conflicting transaction with id others_xid

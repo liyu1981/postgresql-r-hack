@@ -168,7 +168,7 @@ static void populate_co_databases(void);
 
 static bool can_deliver_cached_job(co_database *codb, IMessage *msg,
 								   BackendId *target);
-static WorkerInfo get_idle_worker(co_database *codb);
+static WorkerInfo get_idle_worker(co_database *codb, NodeId origin_node_id);
 static void cache_job(IMessage *msg, co_database *codb);
 static void forward_job(IMessage *msg, co_database *codb,
 						 BackendId backend_id);
@@ -181,15 +181,17 @@ static void add_ooo_msg(IMessage *msg, co_database *codb,
 
 static void manage_workers(bool can_launch);
 
-static void do_start_worker(Oid dboid);
+static void do_start_worker(WorkerInfo wi, Oid dboid);
 
-static void add_as_idle_worker(Oid dbid, bool inc_connected_count);
+static void add_as_idle_worker(WorkerInfo wi, Oid dbid, bool inc_connected_count);
 static void FreeWorkerInfo(int code, Datum arg);
 
 static void avl_sighup_handler(SIGNAL_ARGS);
 static void avl_sigusr2_handler(SIGNAL_ARGS);
 static void avl_sigterm_handler(SIGNAL_ARGS);
 
+static WorkerInfo get_dedicated_worker(co_database *codb, NodeId origin_node_id);
+static void add_dedicated_worker(co_database *codb, WorkerInfo wi);
 
 char *
 decode_worker_state(worker_state state)
@@ -288,6 +290,7 @@ StartCoordinator(void)
 static void
 init_co_database(co_database *codb)
 {
+	int i;
 	Assert(ShmemAddrIsValid(codb));
 	SHMQueueInit(&codb->codb_idle_workers);
 	codb->codb_num_idle_workers = 0;
@@ -304,6 +307,11 @@ init_co_database(co_database *codb)
 	DLInitList(&codb->codb_ooo_msgs);
 
 	codb->codb_num_connected_workers = 0;
+	codb->codb_connected_workers_max = 8;
+	codb->codb_connected_workers =
+		(WorkerInfo*)malloc(codb->codb_connected_workers_max*sizeof(WorkerInfo));
+	for (i=0; i<8; ++i)
+		codb->codb_connected_workers[i] = NULL;
 
 #ifdef REPLICATION
 	codb->state = RDBS_UNKNOWN;
@@ -315,6 +323,29 @@ static void
 cache_job(IMessage *msg, co_database *codb)
 {
 	cached_job *job;
+	buffer b;
+	NodeId origin_node_id = 0;
+
+	IMessageGetReadBuffer(&b, msg);
+	if (get_bytes_read(&b) > 4)
+	{
+		origin_node_id = get_int32(&b);
+	}
+
+	WorkerInfo wi = get_dedicated_worker(codb, origin_node_id);
+	if (wi == NULL)
+	{
+		//wi = (WorkerInfo)malloc(sizeof(WorkerInfoData));
+		LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
+		wi = CoordinatorShmem->co_freeWorkers;
+		CoordinatorShmem->co_freeWorkers = (WorkerInfo)wi->wi_links.next;
+		LWLockRelease(WorkerInfoLock);
+		wi->origin_node_id = origin_node_id;
+		wi->started = false;
+		add_dedicated_worker(codb, wi);
+		codb->codb_num_connected_workers++;
+	}
+
 
 #ifdef COORDINATOR_DEBUG
 	elog(DEBUG5, "Coordinator: caching job of type %s for database %d",
@@ -354,20 +385,30 @@ add_ooo_msg(IMessage *msg, co_database *codb, BackendId backend_id)
  * at least one idle worker and it must hold the CoordinatorDatabasesLock.
  */
 static WorkerInfo
-get_idle_worker(co_database *codb)
+get_idle_worker(co_database *codb, NodeId origin_node_id)
 {
 	WorkerInfo worker;
 
+	//LWLockAcquire(CoordinatorDatabasesLock, LW_EXCLUSIVE);
+
 	/* remove a worker from the list of idle workers */
+	/*
 	worker = (WorkerInfo) SHMQueueNext(&codb->codb_idle_workers,
 									   &codb->codb_idle_workers,
 									   offsetof(WorkerInfoData, wi_links));
 	Assert(worker);
 	SHMQueueDelete(&worker->wi_links);
 	Assert(worker->wi_backend_id != InvalidBackendId);
+	*/
+
+	/* liyu: add the worker to connected workers list, so next time we
+	 * can search for the one associated with same origin_node */
+	worker = get_dedicated_worker(codb, origin_node_id);
 
 	/* maintain per-database counter */
 	codb->codb_num_idle_workers--;
+
+	//LWLockRelease(CoordinatorDatabasesLock);
 
 	return worker;
 }
@@ -382,6 +423,16 @@ get_idle_worker(co_database *codb)
 static void
 forward_job(IMessage *msg, co_database *codb, BackendId backend_id)
 {
+	buffer b;
+	IMessageGetReadBuffer(&b, msg);
+	NodeId origin_node_id = 0;
+	if (get_bytes_read(&b) > 4)
+		origin_node_id = get_int32(&b);
+
+	elog(LOG, "Coordinator: delivering msg %s of size %d for database %d/%d to backend %d",
+	     decode_imessage_type(msg->type), msg->size, codb->codb_dboid, origin_node_id,
+	     backend_id);
+	
 	/* various actions before job delivery depending on the message type */
 	switch (msg->type)
 	{
@@ -419,6 +470,44 @@ forward_job(IMessage *msg, co_database *codb, BackendId backend_id)
 	IMessageActivate(msg, backend_id);
 }
 
+WorkerInfo
+get_dedicated_worker(co_database *codb, NodeId origin_node_id)
+{
+	int i;
+	WorkerInfo wi;
+	for (i=0; i<codb->codb_num_connected_workers; ++i)
+	{
+		wi = codb->codb_connected_workers[i];
+		if (wi != NULL && wi->origin_node_id == origin_node_id)
+			return wi;
+	}
+
+	return NULL;
+}
+
+void
+add_dedicated_worker(co_database *codb, WorkerInfo wi)
+{
+	int i;
+	WorkerInfo *new_array;
+	WorkerInfo *old_array;
+
+	if (codb->codb_num_connected_workers + 1 > codb->codb_connected_workers_max)
+	{
+		new_array =
+			(WorkerInfo*)malloc(sizeof(WorkerInfo)*codb->codb_connected_workers_max*2);
+		for (i=0; i<codb->codb_num_connected_workers; ++i)
+			new_array[i] = codb->codb_connected_workers[i];
+		for (i=codb->codb_num_connected_workers; i<codb->codb_connected_workers_max*2; ++i)
+			new_array[i] = NULL;
+		old_array = codb->codb_connected_workers;
+		codb->codb_connected_workers = new_array;
+		free(old_array);
+	}
+
+	codb->codb_connected_workers[codb->codb_num_connected_workers] = wi;
+}
+
 /*
  * dispatch_job
  *
@@ -431,20 +520,36 @@ dispatch_job(IMessage *msg, co_database *codb)
 {
 	bool can_deliver;
 	BackendId target = InvalidBackendId;
+	buffer b;
+	NodeId origin_node_id = 0;
+	WorkerInfo wi;
+
+	IMessageGetReadBuffer(&b, msg);
+	if (get_bytes_read(&b) > 4)
+	{
+		origin_node_id = get_int32(&b);
+	}
+	wi = get_dedicated_worker(codb, origin_node_id);
 
 	can_deliver = can_deliver_cached_job(codb, msg, &target);
 
-	if (can_deliver && target == InvalidBackendId)
-		can_deliver = (codb->codb_num_idle_workers > 0);
+	group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
+	bool is_from_local_node = (sender_node->id == origin_node_id);
 
-	if (can_deliver)
+	if (is_from_local_node)
 	{
-		if (target == InvalidBackendId)
-			target = get_idle_worker(codb)->wi_backend_id;
-		forward_job(msg, codb, target);
+		if (can_deliver && target != InvalidBackendId)
+			forward_job(msg, codb, target);
+		else
+			cache_job(msg, codb);
 	}
 	else
-		cache_job(msg, codb);
+	{
+		if (wi != NULL && wi->idle && can_deliver)
+			forward_job(msg, codb, wi->wi_backend_id);
+		else
+			cache_job(msg, codb);
+	}
 }
 
 void
@@ -452,23 +557,35 @@ dispatch_ooo_msg(IMessage *msg, co_database *codb)
 {
 	bool can_deliver;
 	BackendId target = InvalidBackendId;
+	buffer b;
+	NodeId origin_node_id = 0;
+	WorkerInfo wi;
+
+	IMessageGetReadBuffer(&b, msg);
+	if (get_bytes_read(&b) > 4)
+	{
+		origin_node_id = get_int32(&b);
+	}
+	wi = get_dedicated_worker(codb, origin_node_id);
 
 	can_deliver = can_deliver_cached_job(codb, msg, &target);
 
-	if (can_deliver && target == InvalidBackendId)
-		can_deliver = (codb->codb_num_idle_workers > 0);
+	group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
+	bool is_from_local_node = (sender_node->id == origin_node_id);
 
-	if (can_deliver)
-    {
-		if (target == InvalidBackendId)
-			target = get_idle_worker(codb)->wi_backend_id;
-		forward_job(msg, codb, target);
-		process_ooo_msgs_for(codb, target);
-		elog(DEBUG1, "Coordinator:       forwarded job to bgworker:%d.", target);
-    }
-	else {
-		add_ooo_msg(msg, codb, InvalidBackendId);
-		elog(DEBUG1, "Coordinator:       job delayed.");
+	if (is_from_local_node)
+	{
+		if (can_deliver && target != InvalidBackendId)
+			forward_job(msg, codb, target);
+		else
+			add_ooo_msg(msg, codb, InvalidBackendId);
+	}
+	else
+	{
+		if (wi != NULL && wi->idle && can_deliver)
+			forward_job(msg, codb, wi->wi_backend_id);
+		else
+			add_ooo_msg(msg, codb, InvalidBackendId);
 	}
 }
 
@@ -497,17 +614,26 @@ process_cached_jobs(co_database *codb)
 		   (job != NULL))
 	{
 		target = InvalidBackendId;
-		if (can_deliver_cached_job(codb, job->cj_msg, &target))
+		buffer b;
+		NodeId origin_node_id = 0;
+		IMessageGetReadBuffer(&b, job->cj_msg);
+		if (get_bytes_read(&b) > 4)
+		{
+			origin_node_id = get_int32(&b);
+		}
+		WorkerInfo wi = get_dedicated_worker(codb, origin_node_id);
+		bool can_deliver = can_deliver_cached_job(codb, job->cj_msg, &target);
+
+		group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
+		bool is_from_local_node = (sender_node->id == origin_node_id);
+
+		if (!is_from_local_node && wi != NULL && can_deliver && wi->idle)
 		{
 			/* remove the job from the cache */
 			DLRemove(&job->cj_links);
 			codb->codb_num_cached_jobs--;
-			
-			/* forward the job to some idle worker and cleanup */
-			if (target == InvalidBackendId)
-				target = get_idle_worker(codb)->wi_backend_id;
 
-			forward_job(job->cj_msg, codb, target);
+			forward_job(job->cj_msg, codb, wi->wi_backend_id);
 			pfree(job);
 
 			/*
@@ -517,6 +643,15 @@ process_cached_jobs(co_database *codb)
 			 */
 			process_ooo_msgs_for(codb, target);
 			
+			job = (cached_job*) DLGetHead(&codb->codb_cached_jobs);
+		}
+		else if (is_from_local_node && can_deliver && target != InvalidBackendId)
+		{
+			DLRemove(&job->cj_links);
+			codb->codb_num_cached_jobs--;
+			forward_job(job->cj_msg, codb, target);
+			pfree(job);
+			process_ooo_msgs_for(codb, target);
 			job = (cached_job*) DLGetHead(&codb->codb_cached_jobs);
 		}
 		else
@@ -542,30 +677,43 @@ process_ooo_msgs_for(co_database *codb, BackendId backend_id)
 		target = InvalidBackendId;
 		can_deliver = false;
 
+		buffer b;
+		NodeId origin_node_id = 0;
+		IMessageGetReadBuffer(&b, cm->cm_msg);
+		if (get_bytes_read(&b) > 4)
+		{
+			origin_node_id = get_int32(&b);
+		}
+
+		WorkerInfo wi = get_dedicated_worker(codb, origin_node_id);
+
 		if (cm->cm_backend_id == InvalidBackendId ||
 			cm->cm_backend_id == backend_id)
 		{
 			can_deliver = can_deliver_cached_job(codb, cm->cm_msg, &target);
 		}
 
-		if (can_deliver)
+		group_node *sender_node = codb->group->gcsi->funcs.get_local_node(codb->group);
+		bool is_from_local_node = (sender_node->id == origin_node_id);
+
+		if (!is_from_local_node && wi != NULL && can_deliver && wi->idle)
 		{
-			if (target == InvalidBackendId)
-			{
-				elog(FATAL, "process_ooo_msg_for: no PGPROC, database %d, backend %d, msg type: %s",
-					 codb->codb_dboid, backend_id, decode_imessage_type(cm->cm_msg->type));
-			}
-
-			Assert(target != InvalidBackendId);
-
 			/* remove the message from the cache */
 			DLRemove(&cm->cm_links);
 			codb->codb_num_ooo_msgs--;
 
-			forward_job(cm->cm_msg, codb, target);
+			forward_job(cm->cm_msg, codb, wi->wi_backend_id);
 			pfree(cm);
 
 			/* re-scan the list of ooo messages */
+			cm = (cached_msg*) DLGetHead(&codb->codb_ooo_msgs);
+		}
+		else if(is_from_local_node && can_deliver && target != InvalidBackendId)
+		{
+			DLRemove(&cm->cm_links);
+			codb->codb_num_ooo_msgs--;
+			forward_job(cm->cm_msg, codb, target);
+			pfree(cm);
 			cm = (cached_msg*) DLGetHead(&codb->codb_ooo_msgs);
 		}
 		else
@@ -1258,140 +1406,36 @@ can_deliver_cached_job(co_database *codb, IMessage *msg, BackendId *target)
 	}
 }
 
-/*
- * manage_workers
- *
- * Starts background workers for databases which have at least one cached
- * job or which have less than min_background_workers connected. Within the
- * same loop, the max_background_workers is checked and terminates a worker
- * accordingly.
- * 
- * Note that at max one worker can be requested to start or stop per
- * invocation.
- */
 static void
 manage_workers(bool can_launch)
 {
 	HASH_SEQ_STATUS			hash_status;
-	co_database	           *codb;
-	Oid                     launch_dboid = InvalidOid;
-	float                   max_score = 0.0,
-		                    score;
-	bool                    worker_slots_available;
-	int                     idle_workers_required;
-	int                     job_workers_required;
+	co_database* codb;
+	int i;
 
-	LWLockAcquire(WorkerInfoLock, LW_SHARED);
-	worker_slots_available = (CoordinatorShmem->co_freeWorkers != NULL);
-	LWLockRelease(WorkerInfoLock);
+	if (CoordinatorShmem->co_startingWorker != NULL)
+		return;
 
-	/*
-	 * Terminate an unneeded worker that has been fetched from the list of
-	 * idle workers in the last invocation. We defer sending the signal one
-	 * invocation to make sure the coordinator had time to handle all
-	 * pending messages from that worker. As idle workers don't ever send
-	 * messages, we can safely assume there is no pending message from that
-	 * worker by now.
-	 */
-	if (terminatable_worker != NULL)
-	{
-		IMessage *msg;
-
-#ifdef COORDINATOR_DEBUG
-		PGPROC *proc = BackendIdGetProc(terminatable_worker->wi_backend_id);
-		if (proc)
-			elog(DEBUG3, "Coordinator: terminating worker [%d/%d].",
-				 proc->pid, terminatable_worker->wi_backend_id);
-		else
-			elog(WARNING, "Coordinator: terminating worker (no PGPROC, backend %d).",
-				 terminatable_worker->wi_backend_id);
-#endif
-
-		msg = IMessageCreate(IMSGT_TERM_WORKER, 0);
-		IMessageActivate(msg, terminatable_worker->wi_backend_id);
-
-		terminatable_worker = NULL;
-	}
-
-#ifdef COORDINATOR_DEBUG
-	elog(DEBUG3, "Coordinator: manage_workers: can_launch: %s, slots_available: %s",
-		 (can_launch ? "true" : "false"), (worker_slots_available ? "true" : "false"));
-#endif
-
-	/*
-	 * Check the list of databases and fire the first pending request
-	 * we find.
-	 */
-	idle_workers_required = 0;
-	job_workers_required = 0;
-	LWLockAcquire(CoordinatorDatabasesLock, LW_SHARED);
+	LWLockAcquire(CoordinatorDatabasesLock, LW_EXCLUSIVE);
 	hash_seq_init(&hash_status, co_databases);
 	while ((codb = (co_database*) hash_seq_search(&hash_status)))
 	{
-		score = ((float) codb->codb_num_cached_jobs /
-				 (float) (codb->codb_num_connected_workers + 1)) * 100.0;
-
-		if (codb->codb_num_idle_workers < min_spare_background_workers)
-			score += (min_spare_background_workers -
-					  codb->codb_num_idle_workers) * 10.0;
-
-#ifdef COORDINATOR_DEBUG
-		elog(DEBUG3, "Coordinator:     db %d, idle/conn: %d/%d, jobs: %d, score: %0.1f",
-			 codb->codb_dboid, codb->codb_num_idle_workers,
-			 codb->codb_num_connected_workers, codb->codb_num_cached_jobs,
-			 score);
-#endif
-
-		if (codb->codb_num_cached_jobs &&
-			(codb->codb_num_connected_workers == 0))
-			job_workers_required++;
-
-		if (codb->codb_num_idle_workers < min_spare_background_workers)
-			idle_workers_required += (min_spare_background_workers -
-									  codb->codb_num_idle_workers);
-
-		/*
-		 * FIXME: "misconfiguration" allows "starvation" in case the global
-		 *        maximum is reached all with idle workers, but other dbs
-		 *        w/o a single worker still have jobs.
-		 */
-		if (can_launch && ((codb->codb_num_cached_jobs > 0) ||
-						   (codb->codb_num_idle_workers <
-							min_spare_background_workers)))
+		for (i=0; i<codb->codb_connected_workers_max; ++i)
 		{
-			if (can_launch && (score > max_score))
+			WorkerInfo wi = codb->codb_connected_workers[i];
+			if (wi == NULL)
+				continue;
+			else
 			{
-				launch_dboid = codb->codb_dboid;
-				max_score = score;
+				if (wi->started == false)
+				{
+					do_start_worker(wi, codb->codb_dboid);
+					break;  // each time only start one bgworker
+				}
 			}
 		}
-
-		/*
-		 * If we are above limit, we fetch an idle worker from the list
-		 * and mark it as terminatable. Actual termination happens in
-		 * the following invocation, see above.
-		 */
-		if ((terminatable_worker == NULL) &&
-			(codb->codb_num_idle_workers > max_spare_background_workers))
-			terminatable_worker = get_idle_worker(codb);
 	}
 	LWLockRelease(CoordinatorDatabasesLock);
-
-	if (!worker_slots_available && idle_workers_required > 0)
-	{
-		elog(WARNING, "Coordinator: no more background workers available, but requiring %d more, according to min_spare_background_workers.",
-			 idle_workers_required);
-	}
-
-	if (!worker_slots_available && job_workers_required > 0)
-	{
-		elog(WARNING, "Coordinator: no background workers avalibale, but %d databases have background jobs pending.",
-			 job_workers_required);
-	}
-
-	/* request a worker for the first database found, which needs one */
-	if (OidIsValid(launch_dboid))
-		do_start_worker(launch_dboid);
 }
 
 bool
@@ -1481,34 +1525,46 @@ CoordinatorCanLaunchWorker(TimestampTz current_time)
  * start a worker.
  */
 void
-do_start_worker(Oid dboid)
+do_start_worker(WorkerInfo wi, Oid dboid)
 {
-	WorkerInfo	worker;
+/* 	WorkerInfo	worker; */
 
-	Assert(OidIsValid(dboid));
+/* 	Assert(OidIsValid(dboid)); */
 
-#ifdef COORDINATOR_DEBUG
-	elog(DEBUG3, "Coordinator: requesting worker for database %d.", dboid);
-#endif
+/* #ifdef COORDINATOR_DEBUG */
+/* 	elog(DEBUG3, "Coordinator: requesting worker for database %d.", dboid); */
+/* #endif */
+
+/* 	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE); */
+
+/* 	/\* */
+/* 	 * Get a worker entry from the freelist.  We checked above, so there */
+/* 	 * really should be a free slot -- complain very loudly if there */
+/* 	 * isn't. */
+/* 	 *\/ */
+/* 	worker = CoordinatorShmem->co_freeWorkers; */
+/* 	if (worker == NULL) */
+/* 		elog(FATAL, "no free worker found"); */
+
+/* 	CoordinatorShmem->co_freeWorkers = (WorkerInfo) worker->wi_links.next; */
+
+/* 	worker->wi_dboid = dboid; */
+/* 	worker->wi_backend_id = InvalidBackendId; */
+/* 	worker->wi_launchtime = GetCurrentTimestamp(); */
+/* 	worker->origin_node_id = origin_node_id; */
+/* 	worker->idle = false; */
+
+/* 	CoordinatorShmem->co_startingWorker = worker; */
+
+/* 	LWLockRelease(WorkerInfoLock); */
 
 	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
 
-	/*
-	 * Get a worker entry from the freelist.  We checked above, so there
-	 * really should be a free slot -- complain very loudly if there
-	 * isn't.
-	 */
-	worker = CoordinatorShmem->co_freeWorkers;
-	if (worker == NULL)
-		elog(FATAL, "no free worker found");
-
-	CoordinatorShmem->co_freeWorkers = (WorkerInfo) worker->wi_links.next;
-
-	worker->wi_dboid = dboid;
-	worker->wi_backend_id = InvalidBackendId;
-	worker->wi_launchtime = GetCurrentTimestamp();
-
-	CoordinatorShmem->co_startingWorker = worker;
+	wi->wi_dboid = dboid;
+	wi->wi_backend_id = InvalidBackendId;
+	wi->wi_launchtime = GetCurrentTimestamp();
+	wi->idle = false;
+	CoordinatorShmem->co_startingWorker = wi;
 
 	LWLockRelease(WorkerInfoLock);
 
@@ -1622,11 +1678,11 @@ StartBackgroundWorker(void)
  * idle worker backends. The caller is expected to hold the WorkerInfoLock.
  */
 static void
-add_as_idle_worker(Oid dbid, bool inc_connected_count)
+add_as_idle_worker(WorkerInfo wi, Oid dbid, bool inc_connected_count)
 {
 	co_database *codb;
 
-	Assert(SHMQueueIsDetached(&MyWorkerInfo->wi_links));
+	//Assert(SHMQueueIsDetached(&MyWorkerInfo->wi_links));
 
 	/* Lookup the corresponding database, or create an entry for it */
 	LWLockAcquire(CoordinatorDatabasesLock, LW_EXCLUSIVE);
@@ -1636,7 +1692,15 @@ add_as_idle_worker(Oid dbid, bool inc_connected_count)
 		codb->codb_num_connected_workers++;
 
 	/* add as an idle worker */
-	SHMQueueInsertBefore(&codb->codb_idle_workers, &MyWorkerInfo->wi_links);
+	// SHMQueueInsertBefore(&codb->codb_idle_workers, &MyWorkerInfo->wi_links);
+
+	/* liyu: not to release the worker for origin_node temporarily, to
+	 * ensure there will at most one bgworker for each origin_node,
+	 * which is much simplier in current implemenation. In future,
+	 * this can be improved. */
+	//remove_dedicated_worker(codb, MyWorkerInfo);
+	wi->idle = true;
+
 	codb->codb_num_idle_workers++;
 
 	LWLockRelease(CoordinatorDatabasesLock);
@@ -1756,7 +1820,7 @@ bgworker_reset(void)
 
 	/* propagate as idle worker, inform the coordinator */
 	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
-	add_as_idle_worker(MyDatabaseId, false);
+	add_as_idle_worker(MyWorkerInfo, MyDatabaseId, false);
 	LWLockRelease(WorkerInfoLock);
 
 	CoordinatorId = GetCoordinatorId();
@@ -1849,6 +1913,23 @@ BackgroundWorkerMain(int argc, char *argv[])
 	if (setsid() < 0)
 		elog(FATAL, "setsid() failed: %m");
 #endif
+
+    /* liyu: add some code for debuging replication bg worker process */
+	if (dbid != 1 /* template1 */) {
+		elog(DEBUG1, "bg worker [%d/%d]: stop wait debug ...", MyProcPid, MyBackendId);
+		while(1)
+		{
+			sleep(1);
+			FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
+			if(fp != NULL)
+			{
+				fclose(fp);
+				break;
+			}
+		}
+		elog(DEBUG1, "bg worker [%d/%d]: ... continue", MyProcPid, MyBackendId);
+	}
+    /* liyu: */
 
 	/*
 	 * Set up signal handlers.	We operate on databases much like a regular
@@ -2009,9 +2090,11 @@ BackgroundWorkerMain(int argc, char *argv[])
 	MyWorkerInfo->wi_state = WS_IDLE;
 
 #ifdef COORDINATOR_DEBUG
-	elog(LOG, "bg worker [%d/%d]: connected to database %d",
-		 MyProcPid, MyBackendId, dbid);
+	elog(LOG, "bg worker [%d/%d]: connected to database %d for origin_node %d",
+	     MyProcPid, MyBackendId, dbid, MyWorkerInfo->origin_node_id);
 #endif
+
+	MyWorkerInfo->started = true;
 
 	/*
 	 * Add as an idle worker and notify the coordinator only *after* having
@@ -2019,7 +2102,7 @@ BackgroundWorkerMain(int argc, char *argv[])
 	 * determine which database we are connected to.
 	 */
 	LWLockAcquire(WorkerInfoLock, LW_EXCLUSIVE);
-	add_as_idle_worker(dbid, true);
+	add_as_idle_worker(MyWorkerInfo, dbid, true);
 	LWLockRelease(WorkerInfoLock);
 
 	/* register with the coordinator */
@@ -2028,23 +2111,6 @@ BackgroundWorkerMain(int argc, char *argv[])
 		msg = IMessageCreate(IMSGT_REGISTER_WORKER, 0);
 		IMessageActivate(msg, coordinator_id);
 	}
-
-    /* liyu: add some code for debuging replication bg worker process */
-	if (dbid != 1 /* template1 */) {
-		elog(DEBUG1, "bg worker [%d/%d]: stop wait debug ...", MyProcPid, MyBackendId);
-		while(1)
-		{
-			sleep(1);
-			FILE* fp = fopen("/var/pg_bgworker_debug.txt", "r");
-			if(fp != NULL)
-			{
-				fclose(fp);
-				break;
-			}
-		}
-		elog(DEBUG1, "bg worker [%d/%d]: ... continue", MyProcPid, MyBackendId);
-	}
-    /* liyu: */
 
 	if (PostAuthDelay)
 		pg_usleep(PostAuthDelay * 1000000L);

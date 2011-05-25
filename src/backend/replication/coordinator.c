@@ -48,6 +48,7 @@
 static gcs_info *gcsi = NULL;			/* the active gcs connection */
 static bool seed_mode = false;
 HTAB *co_txn_info = NULL;
+slock_t co_txn_info_lock;
 
 typedef struct CoTransactionInfo
 {
@@ -515,20 +516,30 @@ get_co_transaction_info(NodeId origin_node_id, TransactionId origin_xid)
 	/* 	pg_usleep(100); /\* dirty waiting 100ms *\/ */
 	/* } */
 
-	key.origin_node_id = origin_node_id;
-	key.origin_xid = origin_xid;
-	xi = hash_search(co_txn_info, &key, HASH_ENTER, &found);
-
-	if (!found)
+	START_CRIT_SECTION();
 	{
-		elog(DEBUG1, "xi created in co_txn_info [total %d]", hash_get_num_entries(co_txn_info));
-		xi->local_backend_id = InvalidBackendId;
-		xi->local_xid = InvalidTransactionId;
-		xi->local_coid = InvalidCommitOrderId;
-		xi->deliverable_cset_no = 0;
-		xi->total_csets = -1;
-		xi->aborted = false;
+		volatile HTAB *co_txn_info_tab = co_txn_info;
+
+		SpinLockAcquire(&co_txn_info_lock);
+
+		key.origin_node_id = origin_node_id;
+		key.origin_xid = origin_xid;
+		xi = hash_search(co_txn_info_tab, &key, HASH_ENTER, &found);
+		
+		if (!found)
+		{
+			elog(DEBUG1, "xi created in co_txn_info [total %d]", hash_get_num_entries(co_txn_info));
+			xi->local_backend_id = InvalidBackendId;
+			xi->local_xid = InvalidTransactionId;
+			xi->local_coid = InvalidCommitOrderId;
+			xi->deliverable_cset_no = 0;
+			xi->total_csets = -1;
+			xi->aborted = false;
+		}
+		
+		SpinLockRelease(&co_txn_info_lock);
 	}
+	END_CRIT_SECTION();
 
 	return xi;
 }
@@ -1021,6 +1032,7 @@ init_co_txn_info_table()
 	co_txn_info = ShmemInitHash("Coordinator: txn info",
 	                            2*replication_co_txn_info_max, 2*replication_co_txn_info_max,
 	                            &hash_ctl, HASH_ELEM | HASH_FUNCTION);
+	SpinLockInit(&co_txn_info_lock);
 }
 
 /*

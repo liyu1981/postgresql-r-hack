@@ -404,7 +404,8 @@ BackgroundWriterMain(void)
 			/* Normal exit from the bgwriter is here */
 			proc_exit(0);		/* done */
 		}
-
+		
+		//if (0) {
 		/*
 		 * Force a checkpoint if too much time has elapsed since the last one.
 		 * Note that we count a timed checkpoint in stats only when this
@@ -532,6 +533,7 @@ BackgroundWriterMain(void)
 		}
 		else
 			BgBufferSync();
+		//}
 
 		/* Check for archive_timeout and switch xlog files if necessary. */
 		CheckArchiveTimeout();

@@ -77,6 +77,10 @@ typedef struct WorkerInfoData
 	TimestampTz wi_launchtime;
 	worker_state wi_state;
 
+	NodeId origin_node_id;
+	bool idle;
+	bool started;
+
 	/* autovacuum specific fields */
 	Oid			wi_tableoid;
 	int			wi_cost_delay;
@@ -162,6 +166,8 @@ typedef struct co_database
 
 	/* tracking of connected workers, shared */
 	int                 codb_num_connected_workers;
+	WorkerInfo         *codb_connected_workers;
+	int                 codb_connected_workers_max;
 
 	/*
 	 * fields used for replication

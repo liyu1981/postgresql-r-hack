@@ -1409,7 +1409,7 @@ continue_scan:
 
 				if (eff_coid != req_coid)
 				{
-					elog(DEBUG5, "bg worker [%d/%d]: ExecProcessTuple: must abort, since an earlier transaction has updated this tuple.",
+					elog(LOG, "bg worker [%d/%d]: ExecProcessTuple: must abort, since an earlier transaction has updated this tuple.",
 						 MyProcPid, MyBackendId);
 					MyProc->abortFlag = true;
 					goto abort_cset_application;
@@ -1425,7 +1425,7 @@ continue_scan:
 			 */
 			if (oldtuple == NULL)
 			{
-				elog(DEBUG1, "bg worker [%d/%d]: ExecProcessTuple: tuple to %s already deleted. Aborting this remote transaction.",
+				elog(LOG, "bg worker [%d/%d]: ExecProcessTuple: tuple to %s already deleted. Aborting this remote transaction.",
 					 MyProcPid, MyBackendId,
 					 (csi->type == CSCMD_UPDATE ? "update" : "delete"));
 				MyProc->abortFlag = true;

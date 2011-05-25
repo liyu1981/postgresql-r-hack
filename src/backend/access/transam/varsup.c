@@ -228,6 +228,8 @@ GetNewTransactionId(bool isSubXact)
 			else
 				myproc->subxids.overflowed = true;
 		}
+
+		elog(DEBUG5, "Transaction id %d goes to proc %d (sub? %d)", xid, myproc->pid, isSubXact);
 	}
 
 	LWLockRelease(XidGenLock);
